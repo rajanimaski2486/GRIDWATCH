@@ -7,7 +7,9 @@ Run: uvicorn hackathon_nyc.server:app --reload --port 8000
 """
 
 from contextlib import asynccontextmanager
+import asyncio
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,32 +31,67 @@ _nemo_builder = None
 _chroma_collection = None
 
 
-async def _init_nemo_agent():
-    """Initialize the NeMo ReAct agent from config_unified.yml."""
+_nat_status: dict = {"state": "not_started", "detail": "", "config": "", "tools": 0}
+
+# Which workflow config to build. Override with NAT_CONFIG to point at
+# profile_local.yml for offline work.
+NAT_CONFIG = os.getenv(
+    "NAT_CONFIG",
+    str(Path(__file__).parent / "configs" / "config_gridwatch.yml"),
+)
+NAT_BUILD_TIMEOUT = float(os.getenv("NAT_BUILD_TIMEOUT", "90"))
+
+
+async def _build_nat_workflow():
+    """Build the NAT workflow. Raises on failure — the caller handles it."""
     global _nemo_workflow, _nemo_builder_ctx, _nemo_builder
+
+    from nat.runtime.loader import PluginTypes, discover_and_register_plugins
+    discover_and_register_plugins(PluginTypes.ALL)
+
+    from nat.utils.io.yaml_tools import yaml_load
+    from nat.utils.data_models.schema_validator import validate_schema
+    from nat.data_models.config import Config
+    from nat.builder.workflow_builder import WorkflowBuilder
+
+    import hackathon_nyc.register  # noqa: F401  (registers the tool groups)
+
+    config = validate_schema(yaml_load(Path(NAT_CONFIG)), Config)
+
+    _nemo_builder_ctx = WorkflowBuilder.from_config(config)
+    _nemo_builder = await _nemo_builder_ctx.__aenter__()
+    _nemo_workflow = await _nemo_builder.build()
+
+    tool_count = 0
+    for group_name in ("flood_tools", "complaint_tools", "geo_tools", "crm_tools", "history_tools"):
+        try:
+            group = await _nemo_builder.get_function_group(group_name)
+            tool_count += len(await group.get_accessible_functions())
+        except Exception:
+            pass
+    return tool_count
+
+
+async def _init_nemo_agent():
+    """Initialize the NAT workflow, bounded by a timeout.
+
+    A hung build must not take the whole server down with it — the dashboard,
+    incident CRM and citizen intake all work without the agent.
+    """
+    global _nemo_workflow
+    _nat_status["config"] = Path(NAT_CONFIG).name
     try:
-        from nat.runtime.loader import PluginTypes, discover_and_register_plugins
-        discover_and_register_plugins(PluginTypes.CONFIG_OBJECT)
-
-        from nat.utils.io.yaml_tools import yaml_load
-        from nat.utils.data_models.schema_validator import validate_schema
-        from nat.data_models.config import Config
-        from nat.builder.workflow_builder import WorkflowBuilder
-
-        import hackathon_nyc.register  # noqa: F401
-
-        config_path = Path(__file__).parent / "configs" / "config_unified.yml"
-        config_dict = yaml_load(config_path)
-        config = validate_schema(config_dict, Config)
-
-        _nemo_builder_ctx = WorkflowBuilder.from_config(config)
-        _nemo_builder = await _nemo_builder_ctx.__aenter__()
-        _nemo_workflow = await _nemo_builder.build()
-
-        logger.info("[NeMo Agent] ReAct agent initialized with 26 tools")
-    except Exception as e:
-        logger.error("[NeMo Agent] Failed to initialize (falling back to v1 chat): %s", e)
+        tool_count = await asyncio.wait_for(_build_nat_workflow(), timeout=NAT_BUILD_TIMEOUT)
+        _nat_status.update(state="ready", detail="", tools=tool_count)
+        logger.info("[NAT] Workflow ready from %s (%d tools)", Path(NAT_CONFIG).name, tool_count)
+    except asyncio.TimeoutError:
         _nemo_workflow = None
+        _nat_status.update(state="degraded", detail=f"build timed out after {NAT_BUILD_TIMEOUT:.0f}s")
+        logger.error("[NAT] Build timed out after %.0fs — serving in degraded mode", NAT_BUILD_TIMEOUT)
+    except Exception as e:
+        _nemo_workflow = None
+        _nat_status.update(state="degraded", detail=f"{type(e).__name__}: {e}")
+        logger.error("[NAT] Build failed — serving in degraded mode: %s", e)
 
 
 def _init_rag():
@@ -92,22 +129,24 @@ async def _shutdown_nemo_agent():
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    # Agent disabled — causes Ollama to hang. Uses v1 chat fallback instead.
-    # await _init_nemo_agent()
+    await _init_nemo_agent()
     _init_rag()
-    # Monitor disabled — depends on agent
-    # try:
-    #     from hackathon_nyc.monitor_agent import start_monitor, stop_monitor
-    #     await start_monitor()
-    # except Exception as e:
-    #     logger.error("[Monitor] Failed to start: %s", e)
+    # Monitor stays disabled until incident mutation goes through the policy
+    # gate — see architecture_review.md §4 and NAT_DEPLOYMENT_PLAN.md phase 4.
+    # Enable with GRIDWATCH_MONITOR=1 once that lands.
+    if os.getenv("GRIDWATCH_MONITOR") == "1":
+        try:
+            from hackathon_nyc.monitor_agent import start_monitor
+            await start_monitor()
+        except Exception as e:
+            logger.error("[Monitor] Failed to start: %s", e)
     yield
-    try:
-        pass
-        # from hackathon_nyc.monitor_agent import stop_monitor
-        # await stop_monitor()
-    except Exception:
-        pass
+    if os.getenv("GRIDWATCH_MONITOR") == "1":
+        try:
+            from hackathon_nyc.monitor_agent import stop_monitor
+            await stop_monitor()
+        except Exception:
+            pass
     await _shutdown_nemo_agent()
 
 
@@ -348,8 +387,6 @@ def check_alerts_for_incident(incident_id: str):
 # Natural Language Urgency Scoring
 # ---------------------------------------------------------------------------
 
-import re as _urgency_re
-
 URGENCY_KEYWORDS = {
     "critical": [
         "trapped", "emergency", "can't get out", "cant get out", "fire",
@@ -587,7 +624,6 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     await websocket.accept()
 
-    import json as _json
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.frames.frames import LLMRunFrame
     from pipecat.pipeline.pipeline import Pipeline
@@ -718,412 +754,108 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# AI Chat — dispatcher command interface via Ollama (Nemotron)
+# AI Chat — dispatcher command interface via the NAT workflow
 # ---------------------------------------------------------------------------
 
-import aiohttp as _aiohttp
-import json as _json
-
 CHAT_HISTORY: list[dict] = []
-
-DISPATCH_SYSTEM_PROMPT = """You are NYC Urban Intelligence dispatch AI. You help dispatchers manage incidents.
-
-You have these actions available. When the dispatcher wants to do something, respond with a JSON action block wrapped in ```action tags. Only ONE action per response.
-
-ACTIONS:
-1. Create incident: ```action\n{"action":"create","title":"...","category":"flooding|sewer|noise|rodent|heat|street_condition|tree|water|other","description":"...","severity":"low|medium|high|critical","address":"..."}\n```
-2. Update status: ```action\n{"action":"update_status","id":"incident_id","status":"new|in_progress|resolved"}\n```
-3. Resolve incident: ```action\n{"action":"resolve","id":"incident_id"}\n```
-4. Confirm incident: ```action\n{"action":"confirm","id":"incident_id"}\n```
-5. Assign incident: ```action\n{"action":"assign","id":"incident_id","assigned_to":"Unit 7"}\n```
-6. Delete incident: ```action\n{"action":"delete","id":"incident_id"}\n```
-7. Get stats: ```action\n{"action":"stats"}\n```
-8. Search/query: ```action\n{"action":"search","status":"","category":"","borough":""}\n```
-9. Send alerts: ```action\n{"action":"send_alerts","id":"incident_id"}\n```
-
-When answering questions about current incidents, use the CURRENT DATA provided below.
-When the user says "resolve" or "mark as resolved" + an incident ID or description, use the resolve action.
-When asked for a sitrep/summary, analyze the current data and give a brief operational summary.
-Be concise and direct — you're talking to a dispatcher, not a civilian.
-Short incident IDs are fine — match on prefix if the full ID isn't given.
-
-CURRENT INCIDENTS:
-{incidents_json}
-
-CURRENT STATS:
-{stats_json}
-"""
-
-
-@app.post("/api/incidents/{incident_id}/vote")
-async def vote_on_incident(incident_id: str, request: Request):
-    """Community upvote/downvote. 3+ upvotes = auto-confirm. -3 = hidden."""
-    data = await request.json()
-    vote = data.get("vote", 0)  # 1 or -1
-    voter_id = data.get("voter_id", "anon_" + str(hash(str(request.client.host)))[:8])
-    if vote not in (1, -1):
-        raise HTTPException(status_code=400, detail="Vote must be 1 or -1")
-    result = db.vote_incident(incident_id, vote, voter_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    return result
-
-
-@app.get("/api/incidents/{incident_id}/votes")
-def get_votes(incident_id: str):
-    """Get vote counts for an incident."""
-    return db.get_incident_votes(incident_id)
 
 
 @app.get("/api/agent/status")
 def agent_status():
-    """Check if the NeMo agent and RAG are loaded."""
+    """Report what the reasoning path is actually doing, for the dashboard panel."""
     return {
         "agent": _nemo_workflow is not None,
+        "state": _nat_status["state"],          # ready | degraded | not_started
+        "detail": _nat_status["detail"],        # why, when degraded
+        "config": _nat_status["config"],        # which YAML is live
+        "tools": _nat_status["tools"],
         "rag": _chroma_collection is not None,
         "rag_docs": _chroma_collection.count() if _chroma_collection else 0,
-        "mode": "agent+rag" if _nemo_workflow and _chroma_collection else
-                "agent" if _nemo_workflow else
-                "rag" if _chroma_collection else "v1_fallback"
+        "mode": "nat" if _nemo_workflow else "degraded_readonly",
     }
+
+
+def _degraded_answer(user_input: str) -> dict:
+    """Read-only reply used when the NAT workflow is unavailable.
+
+    Deliberately incapable of mutating anything. The previous fallback asked an
+    LLM to emit a markdown ```action``` block which the server then parsed and
+    executed — create, delete, confirm and resolve with no policy gate. That is
+    gone. If the agent is down, GridWatch reports state and nothing more.
+    """
+    stats = db.get_stats()
+    incidents = db.list_incidents(limit=10)
+    lines = [
+        "⚠️ Reasoning agent unavailable — read-only mode. "
+        f"({_nat_status['detail'] or 'see /api/agent/status'})",
+        "",
+        f"Incidents: {stats.get('total', 0)} total · "
+        f"{stats.get('open', 0)} open · {stats.get('resolved', 0)} resolved",
+    ]
+    by_cat = stats.get("by_category", {})
+    if by_cat:
+        top = sorted(by_cat.items(), key=lambda kv: -kv[1])[:5]
+        lines.append("Top categories: " + ", ".join(f"{k} ({v})" for k, v in top))
+    if incidents:
+        lines.append("")
+        lines.append("Most recent:")
+        lines += [
+            f"  • #{i['id'][:8]} {i.get('title', '?')[:48]} [{i.get('status', '?')}]"
+            for i in incidents[:5]
+        ]
+    return {"output": "\n".join(lines), "rag_points": [], "mode": "degraded_readonly"}
 
 
 @app.post("/generate")
 async def generate_chat(request: Request):
-    """AI chat endpoint — NeMo ReAct agent + RAG, falls back to v1 pattern matching."""
+    """Dispatcher chat — routed through the NAT workflow.
+
+    The agent decides which tools to call: specialists, CRM, geocoding and the
+    historical ChromaDB search. There are no trigger-word lists and no
+    server-side action execution; incident mutations happen inside NAT tools.
+    """
     data = await request.json()
     user_input = data.get("input", "").strip()
     if not user_input:
         return {"output": "No input provided."}
 
-    # --- RAG context retrieval ---
-    rag_context = ""
-    if _chroma_collection:
-        try:
-            results = _chroma_collection.query(query_texts=[user_input], n_results=1)
-            if results and results['documents'] and results['documents'][0]:
-                rag_context = "\n\nRELEVANT NYC DATA:\n" + "\n---\n".join(results['documents'][0])
-        except Exception as e:
-            logger.error("[RAG] Query failed: %s", e)
+    if _nemo_workflow is None:
+        return _degraded_answer(user_input)
 
-    # --- NeMo ReAct Agent ---
-    if _nemo_workflow is not None:
-        try:
-            from nat.data_models.api_server import ChatRequest, Message, UserMessageContentRoleType
+    from hackathon_nyc.register import reset_map_points, get_map_points
 
-            messages = []
-            for msg in CHAT_HISTORY[-20:]:
-                messages.append(Message(
-                    content=msg["content"],
-                    role=UserMessageContentRoleType(msg["role"]),
-                ))
-            # Append RAG context to user query if available
-            enriched_input = user_input + rag_context if rag_context else user_input
-            messages.append(Message(content=enriched_input, role=UserMessageContentRoleType.USER))
-
-            chat_request = ChatRequest(messages=messages)
-            result = await _nemo_workflow.ainvoke(chat_request)
-
-            if hasattr(result, 'choices') and result.choices:
-                raw_output = result.choices[0].message.content or ""
-            elif isinstance(result, str):
-                raw_output = result
-            else:
-                raw_output = str(result)
-
-            CHAT_HISTORY.append({"role": "user", "content": user_input})
-            CHAT_HISTORY.append({"role": "assistant", "content": raw_output})
-
-            return {"output": raw_output}
-
-        except Exception as e:
-            logger.error("[NeMo Agent] Invoke failed, falling back to v1: %s", e)
-
-    # --- V1 Fallback ---
-
-    # Get current incident data for context
-    incidents = db.list_incidents(limit=50)
-    stats = db.get_stats()
-    incidents_summary = _json.dumps(incidents[:30], indent=1, default=str) if incidents else "No incidents."
-    stats_summary = _json.dumps(stats, indent=1, default=str)
-
-    system_prompt = DISPATCH_SYSTEM_PROMPT.replace(
-        "{incidents_json}", incidents_summary
-    ).replace("{stats_json}", stats_summary)
-
-    # --- AUTO-RAG: if user asks anything historical, query ChromaDB and inject ---
-    rag_context = ""
-    rag_points: list = []
-    rag_triggers = ["histor", "past", "before", "previous", "prior", "ever ",
-                    "have there been", "has there been", "trend", "last year",
-                    "last month", "in the past", "what happened", "show me",
-                    "crash", "collision", "accident", "flood", "rat", "rodent",
-                    "pothole", "violation", "complaint", "near ", "hotspot",
-                    "worst", "dangerous", "most", "where are", "which area",
-                    "concentration", "cluster", "problem area"]
-    if any(t in user_input.lower() for t in rag_triggers):
-        try:
-            from hackathon_nyc.tools.historical_lookup import historical_lookup as _hl
-            # Pick collections by topic words in the query
-            ql = user_input.lower()
-            topic_map = [
-                (("flood", "sewer", "water main"), ["nyc_flood_events"]),
-                (("rat", "rodent", "mouse", "mice"), ["nyc_rodent_inspections"]),
-                (("pothole", "street condition"), ["nyc_potholes"]),
-                (("crash", "collision", "accident"), ["nyc_collisions"]),
-                (("housing", "violation", "landlord", "heat", "hot water"), ["nyc_housing_violations"]),
-                (("311", "complaint", "noise"), ["nyc_311_current"]),
-            ]
-            picked: list = []
-            # Hotspot/worst/dangerous queries search ALL collections
-            if any(w in ql for w in ("hotspot", "worst", "dangerous", "most", "problem area", "cluster")):
-                collections = None  # all collections
-            else:
-                for keys, colls in topic_map:
-                    if any(k in ql for k in keys):
-                        picked = colls
-                        break  # first match wins, single-topic
-                collections = picked or None
-            rag = await _hl(user_input, k=6, collections=collections)
-            chunks = rag.get("results", [])
-            rag_points = rag.get("points", [])
-
-            # --- Geographic filter: if user named a place, geocode and filter to nearby points ---
-            try:
-                import re as _re
-                from math import radians, sin, cos, asin, sqrt
-                # Extract location phrase after "in/near/around/at"
-                m = _re.search(r"\b(?:in|near|around|at|on)\s+(?:the\s+)?([a-zA-Z0-9 \.\-']{3,60})(?:\s*[?\.,]|$)", user_input)
-                place = m.group(1).strip() if m else ""
-                # Trim trailing junk
-                place = _re.sub(r"\b(before|recently|lately|please|thanks?)\b.*$", "", place, flags=_re.I).strip()
-                if place and len(place) >= 3 and rag_points:
-                    from hackathon_nyc.tools.geocoding import geocode_address
-                    geo = await geocode_address(place + ", New York, NY")
-                    if "error" not in geo and geo.get("lat"):
-                        clat, clon = float(geo["lat"]), float(geo["lon"])
-                        def _hav(la1, lo1, la2, lo2):
-                            R = 3958.8
-                            la1, lo1, la2, lo2 = map(radians, (la1, lo1, la2, lo2))
-                            d = 2 * asin(sqrt(sin((la2-la1)/2)**2 + cos(la1)*cos(la2)*sin((lo2-lo1)/2)**2))
-                            return R * d
-                        radius_miles = 5.0
-                        filtered = [p for p in rag_points if _hav(clat, clon, p["lat"], p["lon"]) <= radius_miles]
-                        if filtered:
-                            rag_points = filtered
-                            geo_note = f"\nGEO FILTER: showing {len(filtered)} records within {radius_miles} miles of {place}."
-                        else:
-                            geo_note = ""
-                    else:
-                        geo_note = ""
-                else:
-                    geo_note = ""
-            except Exception as _ge:
-                logger.warning("[RAG geo-filter] %s", _ge)
-                geo_note = ""
-            if chunks:
-                rag_context = "\n\nHISTORICAL DATA FROM NYC OPEN DATA (use this to answer):\n"
-                for c in chunks[:8]:
-                    rag_context += f"[{c['collection']}] {c['text'][:250]}\n"
-                rag_context += f"\nMANDATORY RULES (the user asked a historical question and we found {len(chunks)} matching records):\n1. START your reply with 'Yes' — records exist, you MUST acknowledge them. NEVER say 'no records found' or 'there are no records'.\n2. State the count: '{len(chunks)} records were found'.\n3. Summarize in 2-4 plain English sentences what they contain (top categories, boroughs, dates).\n4. NEVER paste raw JSON, coordinates, geometry, or field names like 'the_geom', 'defnum', 'violationid'.\n5. NEVER contradict the data above by claiming nothing was found."
-        except Exception as _e:
-            logger.warning("[RAG] historical_lookup failed: %s", _e)
-
-    # Build conversation with history (keep last 10 exchanges)
-    messages = [{"role": "system", "content": system_prompt + rag_context}]
-    for msg in CHAT_HISTORY[-20:]:
-        messages.append(msg)
-    messages.append({"role": "user", "content": user_input})
-
-    # Call Ollama
+    reset_map_points()
     try:
-        async with _aiohttp.ClientSession() as session:
-            async with session.post("http://localhost:11435/api/chat", json={
-                "model": "nemotron-mini",
-                "messages": messages,
-                "stream": False,
-            }) as resp:
-                result = await resp.json()
-                ai_response = result.get("message", {}).get("content", "No response from model.")
+        from nat.data_models.api_server import ChatRequest, Message, UserMessageContentRoleType
+
+        messages = [
+            Message(content=m["content"], role=UserMessageContentRoleType(m["role"]))
+            for m in CHAT_HISTORY[-10:]
+        ]
+        messages.append(Message(content=user_input, role=UserMessageContentRoleType.USER))
+
+        async def _run() -> str:
+            # NAT 1.8: workflow.run() yields a Runner; result() converts output.
+            async with _nemo_workflow.run(ChatRequest(messages=messages)) as runner:
+                return await runner.result(to_type=str)
+
+        output = await asyncio.wait_for(
+            _run(), timeout=float(os.getenv("NAT_INVOKE_TIMEOUT", "120")),
+        )
+
+    except asyncio.TimeoutError:
+        logger.error("[NAT] Invoke timed out for input: %.80s", user_input)
+        return {"output": "The agent took too long to respond. Try a narrower question.",
+                "rag_points": [], "mode": "timeout"}
     except Exception as e:
-        return {"output": f"LLM error: {e}"}
+        logger.error("[NAT] Invoke failed: %s", e, exc_info=True)
+        return {"output": f"Agent error: {e}", "rag_points": [], "mode": "error"}
 
-    # If model dumped raw JSON/stats, format it nicely
-    import re
-    if '"by_status"' in ai_response or '"total"' in ai_response or '```yaml' in ai_response or '```json' in ai_response:
-        cleaned = re.sub(r'```(?:yaml|json)?\s*\n?', '', ai_response).strip()
-        json_start = cleaned.find('{')
-        if json_start >= 0:
-            cleaned = cleaned[json_start:]
-            json_end = cleaned.rfind('}') + 1
-            if json_end > 0:
-                cleaned = cleaned[:json_end]
-        try:
-            data = _json.loads(cleaned) if cleaned.startswith('{') else None
-            if data and 'total' in data:
-                lines = [f"SITREP - {data.get('total', 0)} total incidents:"]
-                lines.append(f"Open: {data.get('open', 0)} | In Progress: {data.get('in_progress', 0)} | Resolved: {data.get('resolved', 0)}")
-                if 'by_category' in data:
-                    cats = ', '.join(f"{k}: {v}" for k, v in sorted(data['by_category'].items(), key=lambda x: -x[1]))
-                    lines.append(f"By type: {cats}")
-                if 'by_severity' in data:
-                    sevs = ', '.join(f"{k}: {v}" for k, v in data['by_severity'].items())
-                    lines.append(f"Severity: {sevs}")
-                if 'by_borough' in data:
-                    boros = ', '.join(f"{k}: {v}" for k, v in data['by_borough'].items())
-                    lines.append(f"Boroughs: {boros}")
-                ai_response = '\n'.join(lines)
-        except (_json.JSONDecodeError, TypeError):
-            pass
-
-    # Parse and execute action blocks
-    action_match = re.search(r'```action\s*\n(.*?)\n```', ai_response, re.DOTALL)
-    action_result = None
-
-    if action_match:
-        try:
-            action = _json.loads(action_match.group(1))
-            act = action.get("action", "")
-
-            if act == "create":
-                # Geocode the address
-                lat, lon, addr = None, None, action.get("address", "")
-                if addr:
-                    try:
-                        from hackathon_nyc.tools.geocoding import geocode_address
-                        geo = await geocode_address(addr + ", New York, NY")
-                        if "error" not in geo:
-                            lat, lon = geo["lat"], geo["lon"]
-                            addr = geo.get("display_name", addr)
-                    except Exception:
-                        pass
-                result = db.create_incident(
-                    title=action.get("title", user_input[:60]),
-                    category=action.get("category", "other"),
-                    description=action.get("description", ""),
-                    severity=action.get("severity", "medium"),
-                    latitude=lat, longitude=lon, address=addr,
-                    source="dispatcher_chat",
-                )
-                action_result = f"Incident created: #{result['id'][:8]} — {result['title']}"
-
-            elif act == "update_status" or act == "resolve":
-                inc_id = action.get("id", "")
-                status = "resolved" if act == "resolve" else action.get("status", "in_progress")
-                matched = _match_incident_id(inc_id, incidents)
-                if matched:
-                    db.update_incident(matched["id"], status=status)
-                    action_result = f"#{matched['id'][:8]} status → {status}"
-                else:
-                    action_result = f"No incident matching '{inc_id}'"
-
-            elif act == "confirm":
-                inc_id = action.get("id", "")
-                matched = _match_incident_id(inc_id, incidents)
-                if matched:
-                    db.confirm_incident(matched["id"], confirmed_by="dispatcher_chat")
-                    action_result = f"#{matched['id'][:8]} confirmed"
-                else:
-                    action_result = f"No incident matching '{inc_id}'"
-
-            elif act == "assign":
-                inc_id = action.get("id", "")
-                matched = _match_incident_id(inc_id, incidents)
-                if matched:
-                    db.update_incident(matched["id"], assigned_to=action.get("assigned_to", ""))
-                    action_result = f"#{matched['id'][:8]} assigned to {action.get('assigned_to', '?')}"
-                else:
-                    action_result = f"No incident matching '{inc_id}'"
-
-            elif act == "delete":
-                inc_id = action.get("id", "")
-                matched = _match_incident_id(inc_id, incidents)
-                if matched:
-                    db.delete_incident(matched["id"])
-                    action_result = f"#{matched['id'][:8]} deleted"
-                else:
-                    action_result = f"No incident matching '{inc_id}'"
-
-            elif act == "stats":
-                s = db.get_stats()
-                action_result = f"Total: {s.get('total',0)} | Open: {s.get('open',0)} | Confirmed: {s.get('confirmed',0)} | Resolved: {s.get('resolved',0)}"
-
-            elif act == "search":
-                results = db.list_incidents(
-                    status=action.get("status", ""),
-                    category=action.get("category", ""),
-                    borough=action.get("borough", ""),
-                )
-                action_result = f"Found {len(results)} incidents"
-                if results:
-                    lines = [f"• #{r['id'][:8]} {r['title'][:40]} [{r['status']}]" for r in results[:10]]
-                    action_result += "\n" + "\n".join(lines)
-
-            elif act == "send_alerts":
-                inc_id = action.get("id", "")
-                matched = _match_incident_id(inc_id, incidents)
-                if matched:
-                    action_result = f"Alerts triggered for #{matched['id'][:8]}"
-                else:
-                    action_result = f"No incident matching '{inc_id}'"
-
-        except _json.JSONDecodeError:
-            action_result = "Failed to parse action."
-        except Exception as e:
-            action_result = f"Action failed: {e}"
-
-    # Build final response
-    # Strip the action block from the visible response
-    clean_response = re.sub(r'```action\s*\n.*?\n```', '', ai_response, flags=re.DOTALL).strip()
-    if action_result:
-        output = f"{clean_response}\n\n**→ {action_result}**" if clean_response else f"**→ {action_result}**"
-    else:
-        output = clean_response or ai_response
-
-    # Save to history
     CHAT_HISTORY.append({"role": "user", "content": user_input})
-    CHAT_HISTORY.append({"role": "assistant", "content": ai_response})
+    CHAT_HISTORY.append({"role": "assistant", "content": output})
 
-    # For hotspot/worst/dangerous queries, generate answer from data if model failed
-    ql = user_input.lower()
-    if any(w in ql for w in ("hotspot", "worst", "dangerous", "concentration", "problem area")) and ("sorry" in output.lower() or "cannot" in output.lower() or "no record" in output.lower()):
-        stats = db.get_stats()
-        incidents = db.list_incidents(limit=50)
-        # Count by borough
-        borough_counts = {}
-        for inc in incidents:
-            b = inc.get("borough") or "Unknown"
-            borough_counts[b] = borough_counts.get(b, 0) + 1
-        # Count by category
-        cat_counts = stats.get("by_category", {})
-        top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
-        # Build summary
-        lines = [f"HOTSPOT ANALYSIS — {stats.get('total', 0)} active incidents:"]
-        if top_cats:
-            lines.append("Top incident types: " + ", ".join(f"{k} ({v})" for k, v in top_cats))
-        if borough_counts:
-            top_boros = sorted(borough_counts.items(), key=lambda x: -x[1])[:3]
-            lines.append("Highest concentration: " + ", ".join(f"{k} ({v})" for k, v in top_boros))
-        critical = [i for i in incidents if i.get("severity") in ("critical", "high")]
-        if critical:
-            lines.append(f"{len(critical)} critical/high severity incidents requiring immediate response")
-            for c in critical[:3]:
-                lines.append(f"  - {c.get('title', '?')[:50]} ({c.get('severity')}) at {c.get('address', '?')[:40]}")
-        if rag_points:
-            lines.append(f"{len(rag_points)} historical data points plotted on map")
-        output = "\n".join(lines)
-
-    # Force correct count when geo-filter ran
-    if rag_points:
-        import re as _re2
-        n = len(rag_points)
-        word_map = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-                    6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten"}
-        word = word_map.get(n, str(n))
-        output = _re2.sub(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+records?\b",
-                          f"{n} records", output, count=1, flags=_re2.I)
-
-    return {"output": output, "rag_points": rag_points}
+    # Points recorded by history tools during this run, for the map layer.
+    return {"output": output, "rag_points": get_map_points(), "mode": "nat"}
 
 
 @app.get("/api/risk/{address:path}")
@@ -1229,23 +961,6 @@ async def neighborhood_risk(address: str):
         "top_concern": top_concern,
         "rag_points": all_points,
     }
-
-
-def _match_incident_id(partial_id: str, incidents: list) -> dict | None:
-    """Match a partial incident ID or title against the incident list."""
-    partial_id = partial_id.strip().lstrip("#").lower()
-    if not partial_id:
-        return None
-    for inc in incidents:
-        if inc["id"].lower().startswith(partial_id):
-            return inc
-        if inc["id"].lower() == partial_id:
-            return inc
-    # Try matching by title keywords
-    for inc in incidents:
-        if partial_id in inc.get("title", "").lower():
-            return inc
-    return None
 
 
 # ---------------------------------------------------------------------------
