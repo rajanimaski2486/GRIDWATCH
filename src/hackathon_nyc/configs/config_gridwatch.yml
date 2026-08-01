@@ -1,0 +1,194 @@
+# GridWatch — primary NAT workflow
+#
+# Reasoning: NVIDIA-hosted Nemotron NIMs (build.nvidia.com). No local GPU needed.
+# Requires: export NVIDIA_API_KEY=nvapi-...
+#
+#   nat run   --config_file src/hackathon_nyc/configs/config_gridwatch.yml --input "..."
+#   nat serve --config_file src/hackathon_nyc/configs/config_gridwatch.yml
+#
+# Offline dev on a Mac: use profile_local.yml (same file, Ollama LLMs).
+# All type names verified against nvidia-nat 1.8.0 via `nat info components`.
+
+general:
+  front_end:
+    _type: fastapi
+
+llms:
+  # Planning / orchestration. A real reasoning model — this is what makes the
+  # ReAct loop work where nemotron-mini failed.
+  reasoner:
+    _type: nim
+    model_name: nvidia/llama-3.3-nemotron-super-49b-v1.5
+    temperature: 0.2
+    max_tokens: 4096
+    # api_key omitted on purpose — the NIM client reads NVIDIA_API_KEY from env.
+
+  # Fast path: specialist tool-calling, intake normalization, SMS-length replies.
+  fast:
+    _type: nim
+    model_name: nvidia/nvidia-nemotron-nano-9b-v2
+    temperature: 0.0
+    max_tokens: 2048
+
+embedders:
+  # Used once the RAG index is re-ingested with NIM embeddings.
+  # The committed ChromaDB was built with Chroma's default embedder, so the
+  # historical tools keep using that until re-ingest. See NOTE at bottom.
+  nv_embed:
+    _type: nim
+    model_name: nvidia/nv-embedqa-e5-v5
+
+function_groups:
+  flood_tools:     { _type: nyc_flood_tools }      # 7 tools
+  complaint_tools: { _type: nyc_311_tools }        # 4 tools
+  geo_tools:       { _type: nyc_geo_tools }        # 3 tools
+  crm_tools:       { _type: nyc_crm_tools }        # 12 tools
+  history_tools:   { _type: nyc_history_tools }    # 2 tools — ChromaDB RAG
+
+functions:
+  current_datetime:
+    _type: current_datetime
+
+  # --- Specialists ------------------------------------------------------
+  #
+  # These use react_agent, not tool_calling_agent, on purpose. Verified on
+  # nvidia-nat 1.8.0: tool_calling_agent + a FunctionGroup makes
+  # nemotron-nano-9b-v2 emit an empty tool call ({'name': '', 'id': None}),
+  # which then fails ToolMessage validation. The same model drives the same
+  # tools correctly through react_agent, which is text-based and does not
+  # depend on native tool-calling fidelity. (tool_calling_agent does work with
+  # the 49B model, but that is 5x the model for a lookup.)
+  floodwatch_agent:
+    _type: react_agent
+    llm_name: fast
+    tool_names: [flood_tools, geo_tools]
+    max_tool_calls: 8
+    parse_agent_response_max_retries: 3
+    description: >
+      FloodWatch environmental specialist. Flooding, FloodNet sensor readings,
+      water depth, flood risk and vulnerability, air quality.
+
+  command_center_agent:
+    _type: react_agent
+    llm_name: fast
+    tool_names: [complaint_tools, geo_tools, history_tools]
+    max_tool_calls: 8
+    parse_agent_response_max_retries: 3
+    description: >
+      311 Command Center specialist. Service requests, complaint trends, noise,
+      rodents, heat/hot water, sewer, resident-reported problems, and the
+      historical record of all of the above.
+
+  # Custom NAT function from register.py — runs both specialists concurrently.
+  both_agents:
+    _type: parallel_agent_query
+    agent_1: floodwatch_agent
+    agent_2: command_center_agent
+    description: >
+      Query FloodWatch and 311 Command Center simultaneously. Use for
+      cross-domain questions, or when asked about an area holistically.
+
+# --- Workflow -------------------------------------------------------------
+#
+# The orchestrator is the entry point directly. Wrapping it in a
+# `reasoning_agent` also works and is a nice showcase, but it prepends a full
+# 49B planning pass on top of an already-nested tree (orchestrator ->
+# specialist -> tools) and pushed a simple sitrep past 120s in testing. To
+# re-enable, move this block to a function named `dispatch_agent` and use:
+#
+#   workflow:
+#     _type: reasoning_agent
+#     llm_name: reasoner
+#     augmented_fn: dispatch_agent
+#
+# Keep verbose off here: the reasoning plan contains invented example values
+# (it hallucinated a 2023 date in testing) and must never reach a dispatcher.
+workflow:
+  _type: react_agent
+  llm_name: reasoner
+  max_tool_calls: 12
+  parse_agent_response_max_retries: 3
+  tool_names:
+    - floodwatch_agent
+    - command_center_agent
+    - both_agents
+    - crm_tools
+    - geo_tools
+    - history_tools
+    - current_datetime
+  system_prompt: |
+    You are GridWatch, the NYC Urban Intelligence dispatch system. You serve
+    311 dispatchers managing incidents on a live map.
+
+    ROUTING
+    - Environmental / flooding / sensors -> floodwatch_agent
+    - 311 complaints / noise / rodents / heat -> command_center_agent
+    - Cross-domain or whole-neighborhood questions -> both_agents
+    - Incident create/update/resolve/confirm -> crm_tools
+    - Dashboard counts and sitreps -> crm_tools get_incident_stats directly.
+      Do not route a sitrep to a specialist.
+    - Anything about the past, trends, or repeat locations -> history_tools.
+      Summarize returned records in 2-4 plain sentences (top categories,
+      boroughs, dates). Never paste raw JSON, coordinates or field names.
+
+    CONFIRMATION POLICY (anti-spam — non-negotiable)
+    - Dispatcher-created incidents are auto-confirmed (trusted source).
+    - Citizen reports start UNCONFIRMED.
+    - A report near an existing open incident of the same category bumps its
+      report_count instead of creating a duplicate.
+    - Only CONFIRMED incidents may alert subscribers. Always call check_alerts
+      before claiming anyone was notified; it enforces this and will refuse.
+
+    RULES
+    - Always geocode an address before creating an incident. Never invent
+      coordinates.
+    - Never claim emergency services were dispatched. You file and triage
+      incidents; you do not dispatch responders. For life-threatening reports,
+      tell the user to call 911.
+    - If a report has no usable location, ask one short clarifying question
+      instead of creating an incident.
+    - Never delete or mass-resolve incidents without an explicit, specific
+      instruction naming what to remove.
+    - Answer in plain prose for a dispatcher. Do not paste raw JSON.
+
+    Available tools:
+    {tools}
+
+    Use the following format:
+
+    Question: the input question you must answer
+    Thought: reason about what to do
+    Action: the action to take, should be one of [{tool_names}]
+    Action Input: the input to the action
+    Observation: the result of the action
+
+    ... (this Thought/Action/Action Input/Observation can repeat N times.)
+
+    Thought: I now know the final answer
+    Final Answer: the final answer to the original input question
+
+# --- Evaluation: `nat eval --config_file <this file>` ---------------------
+eval:
+  general:
+    output_dir: .nat/eval/gridwatch
+    dataset:
+      _type: json
+      file_path: evals/dispatch_scenarios.json
+  evaluators:
+    # Did the agent call the right tools in the right order?
+    trajectory:
+      _type: trajectory
+      llm_name: reasoner
+    # Profiler metrics — the NVIDIA performance story, measured not claimed.
+    latency:
+      _type: avg_llm_latency
+    tokens:
+      _type: avg_tokens_per_llm_end
+    llm_calls:
+      _type: avg_num_llm_calls
+
+# NOTE on RAG: NAT 1.8 registers only `milvus_retriever` and `nemo_retriever`
+# as retriever providers — there is no Chroma provider. The 6 ChromaDB
+# collections stay behind tools/historical_lookup.py and should be exposed as a
+# `nyc_history_tools` function group (next step) rather than a `retrievers:`
+# block. Switching to `nv_embed` requires re-running ingest.
