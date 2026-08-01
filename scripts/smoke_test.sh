@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # GridWatch NAT smoke test — run before trusting any deploy.
 #
-#   export NVIDIA_API_KEY=nvapi-...
 #   ./scripts/smoke_test.sh
 #
-# Stages 1-4 are offline. Stage 5 is the only one that spends NIM credits.
+# Stages 1-5 are offline and free. Stage 6 is the only one that spends NIM
+# credits. Reads .env automatically.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# Load .env if present, so you never have to export secrets by hand.
 if [ -f .env ]; then
   set -a; . ./.env; set +a
 fi
@@ -43,14 +42,36 @@ EOF
 echo "  $found"
 
 echo "== 3. Config validation"
-# Capture first: `grep -q` closes the pipe early, which SIGPIPEs nat and trips pipefail.
+# Capture first: `grep -q` closes the pipe early, SIGPIPEs nat, and trips pipefail.
 validate_out=$($NAT validate --config_file "$CONFIG" 2>&1)
 case "$validate_out" in
   *"is valid"*) echo "  ✓ $CONFIG" ;;
   *) echo "$validate_out" | sed 's/^/    /'; fail "config invalid" ;;
 esac
 
-echo "== 4. Workflow build + tool count (offline, dummy key)"
+echo "== 4. Policy gate (deterministic — no LLM involved)"
+$PY - <<'EOF' || fail "policy gate is not enforcing"
+import os
+from hackathon_nyc import policy
+
+d = policy.evaluate_mutation("delete", "")
+assert not d.allowed, "BULK DELETE WAS ALLOWED"
+print("  ✓ unscoped delete refused")
+
+assert policy.evaluate_mutation("delete", "abc123").allowed
+print("  ✓ scoped delete permitted")
+
+assert not policy.is_trusted_source("citizen_sms")
+assert policy.is_trusted_source("dispatcher")
+print("  ✓ citizen_sms untrusted, dispatcher trusted")
+
+os.environ["ALERTS_ENABLED"] = "false"
+assert not policy._load_config()["alerts_enabled"], "kill switch ignored"
+del os.environ["ALERTS_ENABLED"]
+print("  ✓ ALERTS_ENABLED kill switch honored")
+EOF
+
+echo "== 5. Workflow build + tool count (offline, dummy key)"
 NVIDIA_API_KEY="${NVIDIA_API_KEY:-nvapi-dummy}" $PY - "$CONFIG" <<'EOF' || fail "workflow build failed"
 import asyncio, sys
 from pathlib import Path
@@ -61,25 +82,26 @@ from nat.utils.data_models.schema_validator import validate_schema
 from nat.data_models.config import Config
 from nat.builder.workflow_builder import WorkflowBuilder
 
+GROUPS = ["flood_tools", "complaint_tools", "geo_tools", "crm_tools", "history_tools"]
+
 async def main():
     cfg = validate_schema(yaml_load(Path(sys.argv[1])), Config)
     async with WorkflowBuilder.from_config(cfg) as b:
         await b.build()
         total = 0
-        for g in ["flood_tools", "complaint_tools", "geo_tools", "crm_tools"]:
-            grp = await b.get_function_group(g)
-            fns = await grp.get_accessible_functions()
+        for g in GROUPS:
+            fns = await (await b.get_function_group(g)).get_accessible_functions()
             total += len(fns)
             print(f"    {g:16} {len(fns):2}")
         print(f"  ✓ workflow built, {total} tools resolved")
-        # check_alerts is the anti-spam enforcer — never let it drop out again
         crm = await (await b.get_function_group("crm_tools")).get_accessible_functions()
-        assert any("check_alerts" in k for k in crm), "check_alerts missing from crm_tools include list!"
-        print("  ✓ check_alerts present (alert confirmation policy enforceable)")
+        for required in ("check_alerts", "check_mutation_allowed"):
+            assert any(required in k for k in crm), f"{required} missing from crm_tools include list!"
+        print("  ✓ check_alerts + check_mutation_allowed reachable by the agent")
 asyncio.run(main())
 EOF
 
-echo "== 5. Live inference (NVIDIA-hosted Nemotron)"
+echo "== 6. Live inference (NVIDIA-hosted Nemotron)"
 case "${NVIDIA_API_KEY:-}" in
   ""|*paste-yours-here*|nvapi-dummy*)
     echo "  ⊘ skipped — no real NVIDIA_API_KEY yet."
@@ -88,6 +110,6 @@ case "${NVIDIA_API_KEY:-}" in
     echo "    3. Re-run this script"
     exit 0 ;;
 esac
-$NAT run --config_file "$CONFIG" --input "What is the current date and time?" 2>&1 | tail -20
+$NAT run --config_file "$CONFIG" --input "What is the current date and time?" 2>&1 | tail -12
 echo
-echo "If stage 5 returned an answer, the NAT path works end to end."
+echo "If stage 6 returned an answer, the NAT path works end to end."
