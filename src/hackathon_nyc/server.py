@@ -19,8 +19,53 @@ from pydantic import BaseModel
 from pathlib import Path
 
 from hackathon_nyc import db
+from hackathon_nyc import policy
 
 logger = logging.getLogger(__name__)
+
+
+async def _send_alerts(recipients: list, body: str) -> int:
+    """Deliver an approved alert. Callers must pass policy-approved recipients.
+
+    This function decides nothing — policy.evaluate_alert() does. Keeping
+    delivery dumb means there is exactly one place where the confirmation rule
+    can be got wrong.
+    """
+    sent = 0
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_num = os.getenv("TWILIO_PHONE_NUMBER")
+
+    twilio_client = None
+    if sid and token and from_num:
+        try:
+            from twilio.rest import Client as TwilioClient
+            twilio_client = TwilioClient(sid, token)
+        except Exception as e:
+            logger.warning("[Alert] Twilio unavailable: %s", e)
+
+    for sub in recipients:
+        contact = sub.get("contact")
+        if not contact:
+            continue
+        try:
+            if sub.get("contact_type") == "sms":
+                if twilio_client is None:
+                    logger.warning("[Alert] Twilio not configured; SMS skipped")
+                    continue
+                # Twilio's client is blocking; keep it off the event loop.
+                await asyncio.to_thread(
+                    twilio_client.messages.create, body=body, from_=from_num, to=contact
+                )
+            else:
+                from hackathon_nyc.openclaw_alerts import send_alert
+                result = await send_alert(sub["contact_type"], contact, body)
+                if result.get("status") != "sent":
+                    continue
+            sent += 1
+        except Exception as e:
+            logger.warning("[Alert] Delivery failed for a subscriber: %s", e)
+    return sent
 
 # ---------------------------------------------------------------------------
 # NeMo ReAct Agent + RAG — global state
@@ -260,39 +305,22 @@ async def confirm_incident(incident_id: str):
     if not result:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    # Auto-send alerts to nearby subscribers
-    if result.get("latitude") and result.get("longitude"):
-        subscribers = db.find_subscribers_near(
-            result["latitude"], result["longitude"], result.get("category", ""),
+    # Same gate as every other alert path — confirmation alone is not
+    # authorization; the kill switch and recipient cap apply here too.
+    decision = policy.evaluate_alert(incident_id)
+    result["alert_decision"] = decision.as_dict()
+    if decision.allowed and decision.recipients:
+        cat_emoji = {"flooding": "🌊", "sewer": "🚰", "noise": "🎵",
+                     "rodent": "🐀", "heat": "🔥"}.get(result.get("category", ""), "⚠️")
+        result["alerts_sent"] = await _send_alerts(
+            decision.recipients,
+            f"{cat_emoji} NYC Alert: {result['title']} near "
+            f"{result.get('address', 'your area')[:60]}. #{result['id'][:8]}",
         )
-        if subscribers:
-            sent = 0
-            for sub in subscribers:
-                try:
-                    if sub["contact_type"] == "sms":
-                        # Send via Twilio SMS
-                        import os
-                        sid = os.getenv("TWILIO_ACCOUNT_SID", "")
-                        token = os.getenv("TWILIO_AUTH_TOKEN", "")
-                        phone = os.getenv("TWILIO_PHONE_NUMBER", "")
-                        if sid and token and phone:
-                            from twilio.rest import Client
-                            cat_emoji = {'flooding':'🌊','sewer':'🚰','noise':'🎵','rodent':'🐀','heat':'🔥'}.get(result.get("category",""),"⚠️")
-                            Client(sid, token).messages.create(
-                                body=f"{cat_emoji} NYC Alert: {result['title']} near {result.get('address','your area')[:60]}. #{result['id']}",
-                                from_=phone, to=sub["contact"],
-                            )
-                            sent += 1
-                    else:
-                        # Send via OpenClaw (Discord, WhatsApp, Telegram, etc.)
-                        from hackathon_nyc.openclaw_alerts import send_alert
-                        r = await send_alert(sub["contact_type"], sub["contact"], f"⚠️ NYC Alert: {result['title']} near {result.get('address','your area')[:60]}. #{result['id']}")
-                        if r.get("status") == "sent":
-                            sent += 1
-                except Exception as e:
-                    print(f"Alert to {sub['contact']} failed: {e}")
-            result["alerts_sent"] = sent
-            result["alerts_total"] = len(subscribers)
+        result["alerts_total"] = len(decision.recipients)
+    else:
+        result["alerts_sent"] = 0
+        logger.info("[Alert] Suppressed for #%s: %s", incident_id[:8], decision.reason)
 
     return result
 
@@ -581,31 +609,23 @@ async def webhook_report(request: Request):
     incident["urgency_score"] = urgency_score
     incident["urgency_label"] = urgency_label
 
-    # Auto-alert nearby subscribers via SMS
-    if lat and lon:
-        try:
-            subscribers = db.find_subscribers_near(lat, lon, category)
-            if subscribers:
-                import os
-                from twilio.rest import Client as TwilioClient
-                sid = os.getenv("TWILIO_ACCOUNT_SID")
-                token = os.getenv("TWILIO_AUTH_TOKEN")
-                from_num = os.getenv("TWILIO_PHONE_NUMBER")
-                if sid and token and from_num:
-                    tw = TwilioClient(sid, token)
-                    for sub in subscribers:
-                        if sub.get("contact_type") == "sms" and sub.get("contact"):
-                            try:
-                                tw.messages.create(
-                                    body=f"⚠️ GRIDWATCH ALERT: {category.upper()} reported near {address[:60]}. {urgency_label} severity. #{incident['id'][:8]}",
-                                    from_=from_num,
-                                    to=sub["contact"],
-                                )
-                                logger.info(f"[Alert] SMS sent to {sub['contact']} for incident #{incident['id'][:8]}")
-                            except Exception as e:
-                                logger.warning(f"[Alert] SMS failed to {sub['contact']}: {e}")
-        except Exception as e:
-            logger.warning(f"[Alert] check failed: {e}")
+    # Notify nearby subscribers — but only if the policy gate allows it.
+    #
+    # This used to text everyone in range the moment an incident was created,
+    # with no confirmation check, so every citizen report bypassed the
+    # anti-spam rule. A single false report produced real outbound SMS.
+    decision = policy.evaluate_alert(incident["id"])
+    incident["alert_decision"] = decision.as_dict()
+    if decision.allowed and decision.recipients:
+        sent = await _send_alerts(
+            decision.recipients,
+            f"⚠️ GRIDWATCH ALERT: {category.upper()} reported near {address[:60]}. "
+            f"{urgency_label} severity. #{incident['id'][:8]}",
+        )
+        incident["alerts_sent"] = sent
+    else:
+        incident["alerts_sent"] = 0
+        logger.info("[Alert] Suppressed for #%s: %s", incident["id"][:8], decision.reason)
 
     return incident
 

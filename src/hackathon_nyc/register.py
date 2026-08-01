@@ -24,6 +24,7 @@ from nat.data_models.function import FunctionBaseConfig, FunctionGroupBaseConfig
 
 from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding, historical_lookup
 from hackathon_nyc import db
+from hackathon_nyc import policy
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +253,9 @@ class CRMToolConfig(FunctionGroupBaseConfig, name="nyc_crm_tools"):
             "check_alerts",
             "confirm_incident",
             "unsubscribe",
+            # Deterministic policy gate, exposed so the agent can check before
+            # acting. delete_incident enforces it regardless.
+            "check_mutation_allowed",
         ],
         description="Incident CRM tools for dispatchers to manage events on the map",
     )
@@ -322,8 +326,18 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
             return json.dumps({"error": f"Incident {incident_id} not found"})
         return json.dumps(result, indent=2, default=str)
 
+    async def _check_mutation_allowed(action: str, incident_id: str = "") -> str:
+        """Check whether a state-changing action is permitted before doing it. action is one of: delete, resolve_all, mass_alert, confirm, update. Bulk or unscoped destructive actions are refused. Call this before any delete or bulk operation."""
+        decision = policy.evaluate_mutation(action, incident_id)
+        return json.dumps(decision.as_dict(), indent=2, default=str)
+
     async def _delete_incident(incident_id: str) -> str:
-        """Delete an incident from the system entirely."""
+        """Delete a single incident by its exact ID. Requires a specific ID — bulk deletion is not supported."""
+        # The gate runs here too, not only in check_mutation_allowed. A tool
+        # the model can skip is not a control.
+        decision = policy.evaluate_mutation("delete", incident_id)
+        if not decision.allowed:
+            return json.dumps({"deleted": False, "refused": decision.reason}, indent=2)
         success = db.delete_incident(incident_id)
         if not success:
             return json.dumps({"error": f"Incident {incident_id} not found"})
@@ -371,29 +385,19 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         return json.dumps(result, indent=2, default=str)
 
     async def _check_alerts(incident_id: str) -> str:
-        """Check which subscribers should be alerted for a given incident. Only confirmed incidents trigger alerts. Incidents are confirmed by dispatchers or auto-confirmed after 3+ independent reports."""
+        """Check whether an incident may alert subscribers, and who would be notified. Only confirmed incidents trigger alerts. Incidents are confirmed by dispatchers or auto-confirmed after enough independent reports. Call this before telling anyone that notifications were sent."""
+        # Delegates to the deterministic gate so the agent, the webhook and the
+        # confirm endpoint cannot disagree about who may be notified.
+        decision = policy.evaluate_alert(incident_id)
         incident = db.get_incident(incident_id)
-        if not incident:
-            return json.dumps({"error": f"Incident {incident_id} not found"})
-        if not incident.get("confirmed"):
-            return json.dumps({
-                "incident_id": incident_id,
-                "alert_status": "NOT_CONFIRMED",
-                "report_count": incident.get("report_count", 1),
-                "message": f"Incident not yet confirmed. Has {incident.get('report_count', 1)} report(s), needs 3 or dispatcher confirmation. No alerts sent.",
-            }, indent=2, default=str)
-        if not incident.get("latitude") or not incident.get("longitude"):
-            return json.dumps({"error": "Incident has no coordinates"})
-        subscribers = db.find_subscribers_near(
-            incident["latitude"], incident["longitude"], incident.get("category", ""),
-        )
         return json.dumps({
             "incident_id": incident_id,
-            "incident_title": incident["title"],
-            "confirmed": True,
-            "report_count": incident.get("report_count", 1),
-            "subscribers_to_alert": subscribers,
-            "count": len(subscribers),
+            "incident_title": (incident or {}).get("title", ""),
+            "alert_allowed": decision.allowed,
+            "reason": decision.reason,
+            "requires_human_approval": decision.requires_human,
+            "subscribers_to_alert": decision.recipients if decision.allowed else [],
+            "count": len(decision.recipients) if decision.allowed else 0,
         }, indent=2, default=str)
 
     async def _confirm_incident(incident_id: str) -> str:
@@ -422,6 +426,7 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
     group.add_function(name="check_alerts", fn=_check_alerts, description=_check_alerts.__doc__)
     group.add_function(name="confirm_incident", fn=_confirm_incident, description=_confirm_incident.__doc__)
     group.add_function(name="unsubscribe", fn=_unsubscribe, description=_unsubscribe.__doc__)
+    group.add_function(name="check_mutation_allowed", fn=_check_mutation_allowed, description=_check_mutation_allowed.__doc__)
 
     yield group
 
