@@ -9,6 +9,7 @@ Registers four function groups + one parallel executor:
 """
 
 import asyncio
+import contextvars
 import json
 from collections.abc import AsyncGenerator
 
@@ -23,6 +24,36 @@ from nat.data_models.function import FunctionBaseConfig, FunctionGroupBaseConfig
 
 from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding, historical_lookup
 from hackathon_nyc import db
+
+
+# ---------------------------------------------------------------------------
+# Map-point side channel
+#
+# The historical search tool returns prose to the agent, but the dashboard also
+# wants the underlying lat/lon records so it can plot them. Rather than
+# re-running retrieval in the server (which is what the old trigger-word
+# fallback did), the tool records what it found here and /generate reads it
+# after the workflow completes.
+#
+# The ContextVar holds a mutable list and tools EXTEND it rather than calling
+# .set(). A ContextVar assignment inside a child task is invisible to the
+# parent — context propagates down, not back up — but the list object itself is
+# shared, so in-place mutation is seen by the request handler. Each request
+# installs a fresh list, which keeps concurrent requests isolated.
+# ---------------------------------------------------------------------------
+_MAP_POINTS: contextvars.ContextVar[list] = contextvars.ContextVar("gridwatch_map_points", default=[])
+
+
+def reset_map_points() -> list:
+    """Install a fresh point buffer for this request and return it."""
+    buf: list = []
+    _MAP_POINTS.set(buf)
+    return buf
+
+
+def get_map_points() -> list:
+    """Return map points recorded by history tools during this request."""
+    return list(_MAP_POINTS.get())
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +84,9 @@ async def nyc_flood_tools(_config: FloodToolConfig, _builder: Builder) -> AsyncG
         result = await floodnet.get_active_floods(hours_back)
         return json.dumps(result[:20], indent=2, default=str)
 
-    async def _get_flood_sensors() -> str:
+    async def _get_flood_sensors(unused: str = "") -> str:
         """Get all FloodNet sensor deployment locations and coordinates across NYC."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = await floodnet.get_sensor_locations()
         return json.dumps(result, indent=2, default=str)
 
@@ -212,6 +244,14 @@ class CRMToolConfig(FunctionGroupBaseConfig, name="nyc_crm_tools"):
             "delete_incident",
             "get_incident",
             "get_incident_stats",
+            # Alert subscription + confirmation tools. These MUST stay included:
+            # check_alerts is the only code path that enforces the anti-spam
+            # rule that unconfirmed incidents never notify subscribers.
+            "subscribe_alerts",
+            "list_subscriptions",
+            "check_alerts",
+            "confirm_incident",
+            "unsubscribe",
         ],
         description="Incident CRM tools for dispatchers to manage events on the map",
     )
@@ -298,8 +338,9 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         incident["history"] = history
         return json.dumps(incident, indent=2, default=str)
 
-    async def _get_incident_stats() -> str:
+    async def _get_incident_stats(unused: str = "") -> str:
         """Get dashboard statistics: counts by status, category, borough, severity."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = db.get_stats()
         return json.dumps(result, indent=2, default=str)
 
@@ -323,8 +364,9 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         )
         return json.dumps(result, indent=2, default=str)
 
-    async def _list_subscriptions() -> str:
+    async def _list_subscriptions(unused: str = "") -> str:
         """List all active alert subscriptions."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = db.list_subscriptions()
         return json.dumps(result, indent=2, default=str)
 
@@ -380,6 +422,73 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
     group.add_function(name="check_alerts", fn=_check_alerts, description=_check_alerts.__doc__)
     group.add_function(name="confirm_incident", fn=_confirm_incident, description=_confirm_incident.__doc__)
     group.add_function(name="unsubscribe", fn=_unsubscribe, description=_unsubscribe.__doc__)
+
+    yield group
+
+
+# ---------------------------------------------------------------------------
+# Historical RAG Tools (ChromaDB)
+#
+# NAT 1.8 ships only `milvus_retriever` and `nemo_retriever` retriever
+# providers — there is no Chroma provider — so the six local collections are
+# exposed as an ordinary function group instead of a `retrievers:` block.
+# ---------------------------------------------------------------------------
+
+class HistoryToolConfig(FunctionGroupBaseConfig, name="nyc_history_tools"):
+    include: list[str] = Field(
+        default_factory=lambda: [
+            "search_history",
+            "search_history_by_topic",
+        ],
+        description="Historical NYC Open Data retrieval over local ChromaDB collections",
+    )
+
+
+@register_function_group(config_type=HistoryToolConfig)
+async def nyc_history_tools(_config: HistoryToolConfig, _builder: Builder) -> AsyncGenerator[FunctionGroup, None]:
+    group = FunctionGroup(config=_config)
+
+    def _record_points(result: dict) -> None:
+        points = result.get("points") or []
+        if points:
+            _MAP_POINTS.get().extend(points)  # in-place: see note at top of file
+
+    async def _search_history(query: str) -> str:
+        """Search historical NYC Open Data records (311 complaints, collisions, potholes, rodent inspections, housing violations, flood events) for anything relevant to the query. Use this for questions about the past, trends, repeat locations, or whether something has happened before."""
+        result = await historical_lookup.historical_lookup(query, k=6)
+        _record_points(result)
+        chunks = result.get("results", [])
+        if not chunks:
+            return json.dumps({"found": 0, "message": "No historical records matched."})
+        return json.dumps({
+            "found": len(chunks),
+            "records": [{"collection": c["collection"], "text": c["text"][:300]} for c in chunks],
+        }, indent=2, default=str)
+
+    async def _search_history_by_topic(query: str, topic: str) -> str:
+        """Search historical NYC records limited to one topic. topic must be one of: flood, rodent, pothole, collision, housing, 311. Use when the question is clearly about a single domain."""
+        topic_map = {
+            "flood": ["nyc_flood_events"],
+            "rodent": ["nyc_rodent_inspections"],
+            "pothole": ["nyc_potholes"],
+            "collision": ["nyc_collisions"],
+            "housing": ["nyc_housing_violations"],
+            "311": ["nyc_311_current"],
+        }
+        collections = topic_map.get(topic.strip().lower())
+        if collections is None:
+            return json.dumps({"error": f"Unknown topic '{topic}'. Use one of: {', '.join(topic_map)}"})
+        result = await historical_lookup.historical_lookup(query, k=6, collections=collections)
+        _record_points(result)
+        chunks = result.get("results", [])
+        return json.dumps({
+            "found": len(chunks),
+            "topic": topic,
+            "records": [{"collection": c["collection"], "text": c["text"][:300]} for c in chunks],
+        }, indent=2, default=str)
+
+    group.add_function(name="search_history", fn=_search_history, description=_search_history.__doc__)
+    group.add_function(name="search_history_by_topic", fn=_search_history_by_topic, description=_search_history_by_topic.__doc__)
 
     yield group
 

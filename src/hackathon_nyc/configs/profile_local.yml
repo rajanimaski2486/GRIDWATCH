@@ -1,0 +1,75 @@
+# GridWatch — offline dev profile (Mac, no NVIDIA_API_KEY needed)
+#
+# Identical to config_gridwatch.yml except the `llms:` block points at a local
+# Ollama. Use for plumbing work when you have no network. Expect noticeably
+# worse reasoning: nemotron-mini is 4B and struggles with multi-tool planning,
+# which is the original cause of the "agent hangs" note in server.py.
+#
+#   ollama serve && ollama pull nemotron-mini
+#   nat run --config_file src/hackathon_nyc/configs/profile_local.yml --input "..."
+#
+# NOTE: port 11434 is Ollama's default. server.py:941 currently posts to 11435;
+# that is the config drift called out in architecture_review.md.
+
+general:
+  front_end:
+    _type: fastapi
+
+llms:
+  reasoner:
+    _type: openai
+    model_name: nemotron-mini
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    temperature: 0.2
+    max_tokens: 2048
+  fast:
+    _type: openai
+    model_name: nemotron-mini
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    temperature: 0.0
+    max_tokens: 2048
+
+function_groups:
+  flood_tools:     { _type: nyc_flood_tools }
+  complaint_tools: { _type: nyc_311_tools }
+  geo_tools:       { _type: nyc_geo_tools }
+  crm_tools:       { _type: nyc_crm_tools }
+
+functions:
+  current_datetime:
+    _type: current_datetime
+
+  floodwatch_agent:
+    _type: tool_calling_agent
+    llm_name: fast
+    tool_names: [flood_tools, geo_tools]
+    handle_tool_errors: true
+    max_iterations: 6
+    description: FloodWatch environmental specialist — flooding, sensors, air quality.
+
+  command_center_agent:
+    _type: tool_calling_agent
+    llm_name: fast
+    tool_names: [complaint_tools, geo_tools]
+    handle_tool_errors: true
+    max_iterations: 6
+    description: 311 Command Center specialist — complaints, noise, rodents, heat, sewer.
+
+  dispatch_agent:
+    _type: tool_calling_agent
+    llm_name: fast
+    tool_names: [floodwatch_agent, command_center_agent, crm_tools, geo_tools, current_datetime]
+    handle_tool_errors: true
+    max_iterations: 8
+    description: GridWatch dispatch executor for NYC 311.
+
+# Local profile skips the reasoning_agent wrapper — a 4B model plans poorly and
+# the extra hop doubles latency for no gain.
+workflow:
+  _type: tool_calling_agent
+  llm_name: fast
+  tool_names: [floodwatch_agent, command_center_agent, crm_tools, geo_tools, current_datetime]
+  handle_tool_errors: true
+  max_iterations: 8
