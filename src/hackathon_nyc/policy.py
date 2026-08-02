@@ -161,6 +161,50 @@ def evaluate_mutation(action: str, incident_id: str = "", source: str = "") -> D
     return Decision(True, f"'{action}' permitted.")
 
 
+def evaluate_confirmation(incident_id: str, actor: str = "agent") -> Decision:
+    """Decide whether `actor` may confirm this incident.
+
+    Confirmation is what unlocks alerts, so it is the second thing worth
+    gating after alerting itself. A human dispatcher clicking confirm is
+    exercising judgement and is allowed. The agent is not: left ungated it
+    will helpfully confirm a single citizen report to "resolve" a request,
+    which silently defeats the corroboration threshold.
+
+    Found by `nat eval` — the duplicate-report scenario had the agent
+    confirming a 2-report incident and announcing that subscribers would be
+    notified, with the threshold set to 3.
+    """
+    from hackathon_nyc import db
+
+    cfg = _load_config()
+    incident = db.get_incident(incident_id)
+    if not incident:
+        return Decision(False, f"Incident {incident_id} not found.")
+
+    if incident.get("confirmed"):
+        return Decision(True, "Already confirmed.")
+
+    if actor == "dispatcher":
+        return Decision(True, "Confirmed by a dispatcher.")
+
+    source = (incident.get("source") or "").strip().lower()
+    count = incident.get("report_count", 1)
+    needed = cfg["confirmation_reports_required"]
+
+    if source in cfg["trusted_sources"]:
+        return Decision(True, f"Trusted source '{source}'.")
+
+    if count >= needed:
+        return Decision(True, f"{count} independent reports meets the threshold of {needed}.")
+
+    return Decision(
+        False,
+        f"Only a dispatcher may confirm this. It has {count} of {needed} required "
+        f"reports and came from '{source or 'unknown'}'.",
+        requires_human=True,
+    )
+
+
 def is_trusted_source(source: str) -> bool:
     """Whether a source may create incidents that are confirmed on arrival."""
     cfg = _load_config()

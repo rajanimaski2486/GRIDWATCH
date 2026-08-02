@@ -22,7 +22,8 @@ Built for Spark Hack NYC 2026.
    Discord     ─────┤       │            ├─ floodwatch_agent      (nano-9b) 7 flood + 3 geo tools
    Web form    ─────┘       │            ├─ command_center_agent  (nano-9b) 4 x 311 + geo + history
                             │            ├─ both_agents           (parallel, asyncio.gather)
-                            │            └─ crm_tools (13) · history_tools (2) · current_datetime
+                            │            ├─ risk_analyst_agent    (nano-9b) correlations, backtest
+                            │            └─ crm_tools (13) · history_tools (2) · analyst_tools (3)
                             │
                             ├──▶ policy.py ── deterministic gate: every mutation, every alert
                             ├──▶ SQLite / Turso ── incidents, votes, subscriptions
@@ -95,7 +96,7 @@ nat info components -t function_group
 
 `profile_local.yml` swaps the two LLMs to a local Ollama for offline work and changes nothing else.
 
-### Tools — 29 across 5 function groups
+### Tools — 32 across 6 function groups
 
 | Group | Count | What it does |
 |---|---|---|
@@ -104,6 +105,7 @@ nat info components -t function_group
 | `nyc_geo_tools` | 3 | Geocode, reverse geocode, nearest sensors |
 | `nyc_crm_tools` | 13 | Incident CRUD, alert subscriptions, confirmation, policy checks |
 | `nyc_history_tools` | 2 | Historical search over OpenSearch, all indices or one topic |
+| `nyc_analyst_tools` | 3 | Cross-dataset correlations, prediction accuracy, risk scoring |
 
 Plus `parallel_agent_query`, a custom NAT function running two specialists concurrently.
 
@@ -124,6 +126,7 @@ prompt is a suggestion, this is enforcement. Thresholds live in
 - A report within 0.25 mi of an open incident of the same category bumps `report_count` instead of
   creating a duplicate.
 - Destructive actions require an explicit incident id — no bulk deletes.
+- The agent may not confirm a citizen report below the threshold; only a dispatcher can.
 - `ALERTS_ENABLED=false` is a hard kill switch for all outbound messaging.
 - `GRIDWATCH_TOKEN` gates state-changing routes; reads stay open so the public map works.
 
@@ -199,17 +202,14 @@ landed. Read TESTING.md and DEPLOY.md for how things work today.
 
 Stated plainly so nobody has to discover them:
 
-- **Citizen intake is not yet unified.** Discord, Twilio SMS, and the voice pipeline still carry
-  their own keyword classification. Only the webhook path runs through the policy gate.
-- **The background monitor is off**, behind `GRIDWATCH_MONITOR=1`. It creates incidents directly
-  rather than through the gate.
 - **`skills/*/SKILL.md` are prose**, not executable agents. They document intended behavior.
-- **`correlation_analysis.py` and `backtest_predictions.py` are offline scripts** the agent cannot
-  call yet.
-- **`nat eval` is configured but unproven** — the dataset and evaluators exist in the config;
-  the harness has not been run.
-- **`search_311_by_keyword` occasionally receives a schema instead of values** from the agent and
-  fails that one tool call.
+- **The background monitor is off by default**, behind `GRIDWATCH_MONITOR=1`. It now goes through
+  the policy gate and persists its cursors, but has not run for a sustained period.
+- **Multi-argument tools fail when the agent passes a JSON string.** NAT expands a dict into a
+  tool's schema but not a string containing one, so calls like
+  `query_nyc_dataset {"dataset_key": ..., "where_clause": ...}` raise TypeError and that one tool
+  call degrades. Single-argument tools are unaffected.
+- **Trajectory score is 0.70**, not 1.0 — `./scripts/run_eval.sh` shows which scenarios miss.
 
 ---
 

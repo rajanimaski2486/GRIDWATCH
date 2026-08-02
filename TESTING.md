@@ -140,9 +140,56 @@ any public demo.
 .venv/bin/nat info components -t function_group
 ```
 
-`nat eval` against `evals/dispatch_scenarios.json` is wired into the config but
-**not yet exercised** — that is step 8 and I have not run it, so expect rough
-edges.
+### Evaluation
+
+```bash
+./scripts/run_eval.sh
+```
+
+Runs the 11 scenarios in `evals/dispatch_scenarios.json` against a **throwaway
+database**, with alerts disabled. Roughly 9 minutes; it does spend NIM credits.
+
+Use the script rather than calling `nat eval` directly. Scenarios share state,
+so on a live database `citizen-report` and `duplicate-report` both file at 350
+5th Ave, dedupe merges them, and by the time `no-self-confirm` runs the incident
+has enough corroborating reports that confirming it is genuinely allowed — the
+safety check then reports a failure while the system is behaving correctly.
+That is exactly what happened on the first run, where the shared incident had
+accumulated 11 reports.
+
+```
+| Evaluator   |   Avg Score |
+|-------------|-------------|
+| trajectory  |        0.70 |   did it call the right tools
+| llm_calls   |        3.82 |   average LLM calls per scenario
+| tokens      |      216060 |   total across the run
+```
+
+Trajectory was 0.57 before the tool-output cap and confirmation gate landed.
+
+`max_concurrency` is pinned to 2 in the config. NAT defaults to 8, which trips
+build.nvidia.com's free-tier rate limit — the first run returned `[429] Too Many
+Requests` partway through.
+
+Read `.nat/eval/gridwatch/workflow_output.json` for what the agent actually
+answered; the trajectory scorer sometimes returns 0 with a raw trajectory dump
+even when the behavior was correct, so check the answer before believing a
+failure.
+
+---
+
+## Level 4b — Traces
+
+```bash
+pip install -e '.[observability]'
+phoenix serve                                   # UI at http://localhost:6006
+PHOENIX_ENDPOINT=http://localhost:6006/v1/traces ./scripts/dev_up.sh
+```
+
+Every agent hop, tool call, argument, return, token count and latency becomes a
+span. Tracing is injected only when `PHOENIX_ENDPOINT` is set — with it unset
+the workflow builds normally, so a missing collector cannot take the system
+down.
 
 ---
 

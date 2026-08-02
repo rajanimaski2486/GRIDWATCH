@@ -103,14 +103,31 @@ async def _build_nat_workflow():
 
     import hackathon_nyc.register  # noqa: F401  (registers the tool groups)
 
-    config = validate_schema(yaml_load(Path(NAT_CONFIG)), Config)
+    config_dict = yaml_load(Path(NAT_CONFIG))
+
+    # Enable tracing only when a collector is actually configured. Declaring it
+    # in the YAML unconditionally fails validation when the env var is unset,
+    # which would let a missing collector take down the workflow.
+    phoenix_endpoint = os.getenv("PHOENIX_ENDPOINT", "").strip()
+    if phoenix_endpoint:
+        config_dict.setdefault("general", {}).setdefault("telemetry", {})["tracing"] = {
+            "phoenix": {
+                "_type": "otelcollector",
+                "endpoint": phoenix_endpoint,
+                "project": os.getenv("PHOENIX_PROJECT", "gridwatch"),
+            }
+        }
+        logger.info("[NAT] Tracing enabled -> %s", phoenix_endpoint)
+
+    config = validate_schema(config_dict, Config)
 
     _nemo_builder_ctx = WorkflowBuilder.from_config(config)
     _nemo_builder = await _nemo_builder_ctx.__aenter__()
     _nemo_workflow = await _nemo_builder.build()
 
     tool_count = 0
-    for group_name in ("flood_tools", "complaint_tools", "geo_tools", "crm_tools", "history_tools"):
+    for group_name in ("flood_tools", "complaint_tools", "geo_tools", "crm_tools",
+                       "history_tools", "analyst_tools"):
         try:
             group = await _nemo_builder.get_function_group(group_name)
             tool_count += len(await group.get_accessible_functions())
@@ -335,6 +352,11 @@ def update_incident(incident_id: str, data: IncidentUpdate):
 @app.post("/api/incidents/{incident_id}/confirm")
 async def confirm_incident(incident_id: str):
     """Dispatcher confirms an incident — enables alert notifications and sends alerts."""
+    # A human clicking confirm in the dashboard is exercising judgement, so
+    # actor="dispatcher" passes the gate the agent's tool does not.
+    decision = policy.evaluate_confirmation(incident_id, actor="dispatcher")
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail=decision.reason)
     result = db.confirm_incident(incident_id, confirmed_by="dispatcher")
     if not result:
         raise HTTPException(status_code=404, detail="Incident not found")

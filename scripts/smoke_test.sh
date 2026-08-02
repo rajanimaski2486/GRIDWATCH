@@ -125,6 +125,18 @@ async def main():
 asyncio.run(main())
 EOF
 
+echo "== 5b. Telemetry"
+$PY - <<'EOF'
+import os
+ep = os.getenv("PHOENIX_ENDPOINT", "").strip()
+if not ep:
+    print("  \u2298 PHOENIX_ENDPOINT not set \u2014 tracing off (workflow still builds).")
+    print("    Enable: pip install -e '.[observability]' && phoenix serve")
+    print("            PHOENIX_ENDPOINT=http://localhost:6006/v1/traces")
+else:
+    print(f"  \u2713 tracing will export to {ep}")
+EOF
+
 echo "== 6. Live inference (NVIDIA-hosted Nemotron)"
 case "${NVIDIA_API_KEY:-}" in
   ""|*paste-yours-here*|nvapi-dummy*)

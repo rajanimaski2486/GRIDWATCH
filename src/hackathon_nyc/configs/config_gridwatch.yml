@@ -13,6 +13,15 @@ general:
   front_end:
     _type: fastapi
 
+  # Tracing is injected by server.py when PHOENIX_ENDPOINT is set — see
+  # _build_nat_workflow. It is not declared here because NAT resolves an unset
+  # ${PHOENIX_ENDPOINT} to an empty string and fails config validation, which
+  # would mean a missing collector takes down the whole workflow.
+  #
+  #   pip install -e '.[observability]'
+  #   phoenix serve
+  #   PHOENIX_ENDPOINT=http://localhost:6006/v1/traces ./scripts/dev_up.sh
+
 llms:
   # Planning / orchestration. A real reasoning model — this is what makes the
   # ReAct loop work where nemotron-mini failed.
@@ -200,6 +209,11 @@ workflow:
 eval:
   general:
     output_dir: .nat/eval/gridwatch
+    # NAT defaults to 8 concurrent scenarios, which trips build.nvidia.com's
+    # free-tier rate limit — the first run returned [429] Too Many Requests
+    # partway through. Each scenario is itself a nested agent making several
+    # calls, so the real concurrency is well above the scenario count.
+    max_concurrency: 2
     dataset:
       _type: json
       file_path: evals/dispatch_scenarios.json

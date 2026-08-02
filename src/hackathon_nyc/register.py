@@ -64,6 +64,39 @@ def get_map_points() -> list:
     return list(_MAP_POINTS)
 
 
+
+# ---------------------------------------------------------------------------
+# Tool output budget
+#
+# An unbounded tool return can end a conversation outright: during a `nat eval`
+# run one call came back with 125,953 tokens against the model's 128,000 limit
+# and the request was rejected. Tools return JSON for a model to read, not a
+# data export, so every payload is capped and says so when it truncates.
+# ---------------------------------------------------------------------------
+MAX_TOOL_CHARS = 12000
+
+
+def _json_capped(payload, max_chars: int = MAX_TOOL_CHARS) -> str:
+    """Serialize for the model, trimming list payloads until they fit."""
+    text = json.dumps(payload, indent=2, default=str)
+    if len(text) <= max_chars:
+        return text
+
+    if isinstance(payload, list):
+        kept = list(payload)
+        while kept and len(json.dumps(kept, indent=2, default=str)) > max_chars - 200:
+            kept = kept[:max(1, len(kept) * 3 // 4)]
+        return json.dumps(
+            {"truncated": True,
+             "showing": len(kept),
+             "of": len(payload),
+             "note": "Result set trimmed to fit the model context. Narrow the query for more.",
+             "results": kept},
+            indent=2, default=str)
+
+    return text[:max_chars] + '\n... [truncated to fit model context]'
+
+
 # ---------------------------------------------------------------------------
 # FloodNet / Environmental Tools
 # ---------------------------------------------------------------------------
@@ -90,38 +123,38 @@ async def nyc_flood_tools(_config: FloodToolConfig, _builder: Builder) -> AsyncG
     async def _get_active_floods(hours_back: int = 24) -> str:
         """Get flooding events from the last N hours from FloodNet sensors across NYC."""
         result = await floodnet.get_active_floods(hours_back)
-        return json.dumps(result[:20], indent=2, default=str)
+        return _json_capped(result[:20])
 
     async def _get_flood_sensors(unused: str = "") -> str:
         """Get all FloodNet sensor deployment locations and coordinates across NYC."""
         del unused  # NAT requires single_fn to take exactly one parameter
         result = await floodnet.get_sensor_locations()
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _get_worst_floods(top_n: int = 10) -> str:
         """Get the worst flooding events by maximum water depth in inches."""
         result = await floodnet.get_worst_floods(top_n)
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _get_flood_history(sensor_id: str) -> str:
         """Get flood history for a specific FloodNet sensor by its sensor ID."""
         result = await floodnet.get_flood_history_for_sensor(sensor_id)
-        return json.dumps(result[:20], indent=2, default=str)
+        return _json_capped(result[:20])
 
     async def _get_flood_vulnerability(limit: int = 50) -> str:
         """Get flood vulnerability index scores by NYC neighborhood."""
         result = await nyc_opendata.get_flood_vulnerability(limit)
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _get_air_quality(neighborhood: str = "") -> str:
         """Get air quality data (PM2.5, NO2) by NYC neighborhood. Optionally filter by neighborhood name."""
         result = await nyc_opendata.get_air_quality(neighborhood)
-        return json.dumps(result[:20], indent=2, default=str)
+        return _json_capped(result[:20])
 
     async def _query_nyc_dataset(dataset_key: str, where_clause: str = "", limit: int = 50) -> str:
         """Query any NYC Open Data dataset by key. Available datasets: 311_current, air_quality, flood_events, flood_sensors, flood_vulnerability, heat_vulnerability, street_trees, greenhouse_gas, community_gardens, pluto."""
         result = await nyc_opendata.query_dataset(dataset_key, where_clause=where_clause, limit=limit)
-        return json.dumps(result[:20], indent=2, default=str)
+        return _json_capped(result[:20])
 
     group.add_function(name="get_active_floods", fn=_get_active_floods, description=_get_active_floods.__doc__)
     group.add_function(name="get_flood_sensors", fn=_get_flood_sensors, description=_get_flood_sensors.__doc__)
@@ -157,12 +190,12 @@ async def nyc_311_tools(_config: ThreeOneOneToolConfig, _builder: Builder) -> As
     async def _get_311_complaints(complaint_type: str = "", borough: str = "", zip_code: str = "", limit: int = 20) -> str:
         """Get recent 311 service requests. Filter by complaint_type (e.g. 'Noise - Residential', 'Sewer', 'Rodent', 'HEAT/HOT WATER'), borough (e.g. 'BROOKLYN'), or zip_code."""
         result = await nyc_opendata.get_311_complaints(complaint_type, borough, zip_code, limit)
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _get_311_stats(complaint_type: str = "", borough: str = "", group_by: str = "complaint_type") -> str:
         """Get aggregated 311 complaint statistics. Returns counts grouped by complaint_type, borough, or other field."""
         result = await nyc_opendata.get_311_complaint_stats(complaint_type, borough, group_by)
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _get_311_by_location(lat: float, lon: float, radius_meters: int = 500, limit: int = 20) -> str:
         """Get 311 complaints near a specific lat/lon location within a radius in meters."""
@@ -173,7 +206,7 @@ async def nyc_311_tools(_config: ThreeOneOneToolConfig, _builder: Builder) -> As
             select="unique_key,created_date,complaint_type,descriptor,latitude,longitude,status",
             limit=limit,
         )
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _search_311_by_keyword(keyword: str, limit: int = 20) -> str:
         """Search 311 complaints by keyword in the descriptor field."""
@@ -184,7 +217,7 @@ async def nyc_311_tools(_config: ThreeOneOneToolConfig, _builder: Builder) -> As
             select="unique_key,created_date,complaint_type,descriptor,borough,latitude,longitude,status",
             limit=limit,
         )
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     group.add_function(name="get_311_complaints", fn=_get_311_complaints, description=_get_311_complaints.__doc__)
     group.add_function(name="get_311_stats", fn=_get_311_stats, description=_get_311_stats.__doc__)
@@ -289,12 +322,12 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
             address=address, borough=borough, zip_code=zip_code,
             assigned_to=assigned_to, source="agent",
         )
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _list_incidents(status: str = "", category: str = "", borough: str = "", limit: int = 50) -> str:
         """List all incidents, optionally filtered by status (open, in_progress, resolved), category, or borough."""
         result = db.list_incidents(status=status, category=category, borough=borough, limit=limit)
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _update_incident(
         incident_id: str,
@@ -316,7 +349,7 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         )
         if not result:
             return json.dumps({"error": f"Incident {incident_id} not found"})
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _resolve_incident(incident_id: str, resolution_notes: str = "") -> str:
         """Mark an incident as resolved with optional resolution notes."""
@@ -329,7 +362,7 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         )
         if not result:
             return json.dumps({"error": f"Incident {incident_id} not found"})
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _check_mutation_allowed(action: str, incident_id: str = "") -> str:
         """Check whether a state-changing action is permitted before doing it. action is one of: delete, resolve_all, mass_alert, confirm, update. Bulk or unscoped destructive actions are refused. Call this before any delete or bulk operation."""
@@ -361,7 +394,7 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         """Get dashboard statistics: counts by status, category, borough, severity."""
         del unused  # NAT requires single_fn to take exactly one parameter
         result = db.get_stats()
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _subscribe_alerts(
         name: str,
@@ -381,13 +414,13 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
             latitude=geo_result["lat"], longitude=geo_result["lon"],
             address=address, radius_miles=radius_miles, categories=categories,
         )
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _list_subscriptions(unused: str = "") -> str:
         """List all active alert subscriptions."""
         del unused  # NAT requires single_fn to take exactly one parameter
         result = db.list_subscriptions()
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _check_alerts(incident_id: str) -> str:
         """Check whether an incident may alert subscribers, and who would be notified. Only confirmed incidents trigger alerts. Incidents are confirmed by dispatchers or auto-confirmed after enough independent reports. Call this before telling anyone that notifications were sent."""
@@ -406,11 +439,18 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         }, indent=2, default=str)
 
     async def _confirm_incident(incident_id: str) -> str:
-        """Dispatcher action: manually confirm an incident so it triggers alerts to nearby subscribers."""
-        result = db.confirm_incident(incident_id, confirmed_by="dispatcher")
+        """Confirm an incident so it can alert nearby subscribers. Only permitted when the incident already has enough independent reports or came from a trusted source; otherwise a human dispatcher must confirm it."""
+        # actor="agent": you are not a dispatcher. Confirmation unlocks
+        # outbound alerts, so the corroboration threshold has to hold even
+        # when confirming would neatly resolve the request.
+        decision = policy.evaluate_confirmation(incident_id, actor="agent")
+        if not decision.allowed:
+            return json.dumps({"confirmed": False, "refused": decision.reason,
+                               "requires_human": decision.requires_human}, indent=2)
+        result = db.confirm_incident(incident_id, confirmed_by="agent")
         if not result:
             return json.dumps({"error": f"Incident {incident_id} not found"})
-        return json.dumps(result, indent=2, default=str)
+        return _json_capped(result)
 
     async def _unsubscribe(subscription_id: str) -> str:
         """Unsubscribe a person from alerts by their subscription ID."""
