@@ -15,6 +15,9 @@ Built for Spark Hack NYC 2026.
 
 ## Architecture
 
+Diagrams for each layer live in [docs/diagrams/](docs/diagrams/) — open the
+`.excalidraw` files at excalidraw.com. Start with `00-master`.
+
 ```
    Browser ──▶ Dashboard (index.html, Mapbox GL + deck.gl)
                     │
@@ -189,6 +192,7 @@ python -m hackathon_nyc.ingest_opensearch --all --download
 |---|---|
 | [TESTING.md](TESTING.md) | How to verify what works, layered from smoke test to container |
 | [DEPLOY.md](DEPLOY.md) | Vercel + Hugging Face Spaces + Turso + Aiven, all free tier |
+| [docs/diagrams/](docs/diagrams/) | Excalidraw set — one per layer, plus a walkthrough script |
 | [architecture_review.md](architecture_review.md) | The original diagnosis |
 | [GRIDWATCH_EXPLAINED.md](GRIDWATCH_EXPLAINED.md) | Walkthrough and NAT feature mapping |
 | [NAT_DEPLOYMENT_PLAN.md](NAT_DEPLOYMENT_PLAN.md) | The migration plan |
