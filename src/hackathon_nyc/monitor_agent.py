@@ -18,16 +18,47 @@ from datetime import datetime, timedelta
 from math import radians, cos, sin, sqrt, atan2
 
 from hackathon_nyc import db
+from hackathon_nyc import policy
 from hackathon_nyc.tools import floodnet, nyc_opendata
 
 logger = logging.getLogger(__name__)
 
-# Module-level state
+# Cursors are cached in memory for the cycle and persisted to the database, so
+# a restart does not replay the same flood events and complaints and re-file
+# incidents that already exist.
 _monitor_task: asyncio.Task | None = None
 _last_flood_ids: set[str] = set()
 _last_311_keys: set[str] = set()
 _complaint_history: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 # { zip_code: { category: count_this_cycle } }
+
+STATE_FLOOD_IDS = "monitor.last_flood_ids"
+STATE_311_KEYS = "monitor.last_311_keys"
+STATE_COMPLAINTS = "monitor.complaint_history"
+# Cap what we persist; the cursor only needs the recent past to dedupe.
+MAX_PERSISTED_IDS = 2000
+
+
+def _load_cursors() -> None:
+    """Restore monitor cursors from the database on startup."""
+    global _last_flood_ids, _last_311_keys, _complaint_history
+    _last_flood_ids = set(db.get_state(STATE_FLOOD_IDS, []) or [])
+    _last_311_keys = set(db.get_state(STATE_311_KEYS, []) or [])
+    history = db.get_state(STATE_COMPLAINTS, {}) or {}
+    _complaint_history = defaultdict(lambda: defaultdict(int),
+                                     {z: defaultdict(int, c) for z, c in history.items()})
+    logger.info("[Monitor] Restored cursors: %d flood ids, %d 311 keys, %d zips",
+                len(_last_flood_ids), len(_last_311_keys), len(_complaint_history))
+
+
+def _save_cursors() -> None:
+    """Persist monitor cursors after a cycle."""
+    try:
+        db.set_state(STATE_FLOOD_IDS, list(_last_flood_ids)[-MAX_PERSISTED_IDS:])
+        db.set_state(STATE_311_KEYS, list(_last_311_keys)[-MAX_PERSISTED_IDS:])
+        db.set_state(STATE_COMPLAINTS, {z: dict(c) for z, c in _complaint_history.items()})
+    except Exception as e:
+        logger.error("[Monitor] Could not persist cursors: %s", e)
 
 POLL_INTERVAL_SECONDS = 300  # 5 minutes
 TRACKED_311_TYPES = [
@@ -196,8 +227,20 @@ def _detect_anomalies(new_311: list[dict]) -> list[dict]:
 async def _create_auto_incident(title: str, category: str, description: str,
                                  severity: str, lat: float | None, lon: float | None,
                                  source: str, sensor_id: str = "", related_311: str = ""):
-    """Create an incident from automated monitoring signals."""
+    """Create an incident from an automated monitoring signal.
+
+    Routes through the policy gate rather than calling db.create_incident
+    directly. Sensor readings and complaint spikes are evidence, not
+    confirmation — a spike alone must not text anybody, and only
+    monitor_crossref (sensor corroborated by citizen reports) is trusted.
+    This is why the monitor was left disabled until the gate existed.
+    """
     try:
+        decision = policy.evaluate_mutation("create", source=source)
+        if not decision.allowed:
+            logger.warning("[Monitor] Incident creation refused: %s", decision.reason)
+            return None
+
         incident = db.create_incident(
             title=title,
             category=category,
@@ -209,7 +252,20 @@ async def _create_auto_incident(title: str, category: str, description: str,
             related_sensor_id=sensor_id,
             related_311_id=related_311,
         )
-        logger.info("[Monitor] Auto-created incident #%s: %s", incident["id"][:8], title)
+        logger.info("[Monitor] Created incident #%s (%s): %s",
+                    incident["id"][:8], source, title)
+
+        alert = policy.evaluate_alert(incident["id"])
+        if alert.allowed and alert.recipients:
+            from hackathon_nyc.server import _send_alerts
+            sent = await _send_alerts(
+                alert.recipients,
+                f"⚠️ GRIDWATCH: {category.upper()} detected near "
+                f"{(incident.get('address') or 'your area')[:60]}. #{incident['id'][:8]}",
+            )
+            logger.info("[Monitor] Alerted %d subscriber(s) for #%s", sent, incident["id"][:8])
+        else:
+            logger.info("[Monitor] No alerts for #%s: %s", incident["id"][:8], alert.reason)
         return incident
     except Exception as e:
         logger.error("[Monitor] Failed to create incident: %s", e)
@@ -311,6 +367,7 @@ async def _run_cycle():
             source="monitor_anomaly",
         )
 
+    _save_cursors()
     logger.info("[Monitor] Cycle complete. Clusters=%d, Anomalies=%d",
                 len(clusters), len(anomalies))
 
@@ -341,6 +398,7 @@ async def start_monitor():
     """Start the background monitoring task. Called from server.py lifespan."""
     global _monitor_task
     if _monitor_task is None or _monitor_task.done():
+        _load_cursors()
         _monitor_task = asyncio.create_task(_monitor_loop())
         logger.info("[Monitor] Background monitor task created.")
 

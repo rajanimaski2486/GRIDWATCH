@@ -26,6 +26,7 @@ Run: pip install twilio
 import os
 from fastapi import Request, Response
 from hackathon_nyc import db
+from hackathon_nyc import intake
 from hackathon_nyc.tools import geocoding
 
 # Twilio credentials from environment
@@ -118,33 +119,13 @@ def register_twilio_routes(app):
         if not transcription:
             return {"status": "no transcription"}
 
-        # Try to geocode address from transcription
-        lat, lon, address = None, None, ""
-        try:
-            import re
-            # Fix common Twilio transcription errors
-            transcription = re.sub(r'\$(\d+)\.00', r'\1', transcription)
-            transcription = re.sub(r'\$(\d+)', r'\1', transcription)
-            cleaned = re.sub(r'\b(report|there is|flooding|flood|noise|rats?|sewer|pothole|water|about|deep|inches|feet|foot|the|a|an|i want to)\b', ' ', transcription, flags=re.IGNORECASE)
-            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-            for query in [cleaned + ', New York City', transcription + ', New York']:
-                geo = await geocoding.geocode_address(query)
-                if "error" not in geo:
-                    lat, lon = geo["lat"], geo["lon"]
-                    address = geo.get("display_name", "")
-                    break
-        except Exception:
-            pass
-
-        incident = db.create_incident(
-            title=f"Voice report: {transcription[:60]}",
-            category="other",
-            description=f"Voicemail from {caller}: {transcription}\n\nRecording: {recording_url}",
-            source="citizen_voice",
-            latitude=lat,
-            longitude=lon,
-            address=address,
+        result = await intake.process_report(
+            text=transcription,
+            source="voice",
+            user=caller,
         )
+        incident = result.incident
+        incident["description"] = f"Voicemail recording: {recording_url}"
 
         if TWILIO_SID and caller != "unknown":
             try:
@@ -197,48 +178,16 @@ def register_twilio_routes(app):
             reply = "You've been unsubscribed from all alerts."
 
         else:
-            # Create incident from SMS — geocode address from message
-            lat, lon, address = None, None, ""
-            try:
-                import re
-                # Strip incident keywords but keep location words
-                cleaned = re.sub(r'\b(report|flooding|flood|noise|loud|rats?|rodent|sewer|pothole|water|fire|gas leak|tree down|blocking|crash|accident|broken|there is|there are|i see|help|please|emergency)\b', ' ', body, flags=re.IGNORECASE)
-                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-                if not cleaned or len(cleaned) < 3:
-                    cleaned = body
-                for query in [cleaned + ', Manhattan, NYC', cleaned + ', Brooklyn, NYC', cleaned + ', Queens, NYC', cleaned + ', New York City, NY']:
-                    geo = await geocoding.geocode_address(query)
-                    if "error" not in geo:
-                        lat, lon = geo["lat"], geo["lon"]
-                        address = geo.get("display_name", "")
-                        break
-            except Exception:
-                pass
-
-            # Detect category from keywords
-            msg_lower = body.lower()
-            category = "other"
-            for kw, cat in [("flood", "flooding"), ("water main", "flooding"), ("sewer", "sewer"),
-                            ("gas leak", "sewer"), ("noise", "noise"), ("loud", "noise"),
-                            ("rat", "rodent"), ("mouse", "rodent"), ("roach", "rodent"),
-                            ("heat", "heat"), ("hot water", "heat"), ("no heat", "heat"),
-                            ("pothole", "street_condition"), ("crash", "street_condition"),
-                            ("tree", "tree"), ("branch", "tree"), ("water", "water"),
-                            ("hydrant", "water"), ("leak", "water"), ("fire", "other")]:
-                if kw in msg_lower:
-                    category = cat
-                    break
-
-            incident = db.create_incident(
-                title=f"SMS report: {body[:60]}",
-                category=category,
-                description=f"SMS from {sender}: {body}",
-                source="citizen_sms",
-                latitude=lat,
-                longitude=lon,
-                address=address,
+            result = await intake.process_report(
+                text=body,
+                source="sms",
+                user=sender,
             )
-            reply = f"Report #{incident['id']} received. A dispatcher will review it. Text ALERT + your address to get nearby incident alerts."
+            incident = result.incident
+            # intake composes a channel-appropriate reply, including the
+            # 911 redirect for life-safety reports and a clarifying question
+            # when no address could be resolved.
+            reply = result.reply()
 
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
         <Response><Message>{reply}</Message></Response>"""

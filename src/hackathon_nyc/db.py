@@ -108,6 +108,12 @@ def _create_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_incidents_borough ON incidents(borough);
         CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at);
 
+        CREATE TABLE IF NOT EXISTS agent_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS alert_subscriptions (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -536,3 +542,37 @@ def find_subscribers_near(latitude: float, longitude: float, category: str = "")
             results.append(r)
 
     return sorted(results, key=lambda x: x["distance_miles"])
+
+
+# ---------------------------------------------------------------------------
+# Durable agent state
+#
+# The background monitor kept its cursors — seen flood ids, seen 311 keys,
+# per-zip complaint counts — in module globals, so every restart replayed the
+# same events and re-filed the same incidents. These persist them instead.
+# ---------------------------------------------------------------------------
+
+def get_state(key: str, default=None):
+    """Read a JSON-serializable value previously stored with set_state."""
+    conn = get_db()
+    row = conn.execute("SELECT value FROM agent_state WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value"] if hasattr(row, "keys") else row[0])
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def set_state(key: str, value) -> None:
+    """Persist a JSON-serializable value under `key`."""
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO agent_state (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                          updated_at = excluded.updated_at""",
+        (key, json.dumps(value, default=str), datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()

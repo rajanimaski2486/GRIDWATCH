@@ -14,13 +14,10 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 WEBHOOK_URL = "http://localhost:8000/api/webhook/report"
 SUBSCRIBE_URL = "http://localhost:8000/api/alerts/subscribe"
 
-# Keywords that indicate a report (not casual chat)
-REPORT_KEYWORDS = [
-    "flood", "sewer", "noise", "loud", "rat", "rodent", "mouse",
-    "heat", "hot water", "pothole", "crash", "accident", "fire",
-    "tree", "water", "construction", "broken", "damaged", "leak",
-    "smell", "gas", "electric", "power", "sidewalk", "street",
-]
+# Whether a message is a report is decided by intake.looks_like_report, which
+# shares the category rules the rest of the system uses. This module used to
+# keep its own keyword list, which drifted from the others.
+from hackathon_nyc import intake
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -70,15 +67,14 @@ async def on_message(message):
         return
 
     # Check if it looks like a report
-    is_report = any(kw in text_lower for kw in REPORT_KEYWORDS)
+    is_report = intake.looks_like_report(text)
     if not is_report and not is_dm:
         # In servers, ignore non-report messages even if mentioned
         return
 
-    # Clean message for better geocoding
-    text = text.replace(' and ', ' & ').replace(' AND ', ' & ')
+    # Transcript/text cleanup happens in intake, not here.
 
-    # Forward to webhook
+    # Forward to the shared intake endpoint
     await message.add_reaction("👀")
 
     async with aiohttp.ClientSession() as session:
@@ -95,7 +91,13 @@ async def on_message(message):
                 addr = data.get("address", "")
                 cat = data.get("category", "other")
                 short_addr = addr[:40] + "..." if len(addr) > 40 else addr
-                await message.reply(f"Incident **#{incident_id}** created — {cat} near {short_addr}", mention_author=False)
+                # intake supplies the reply, so Discord says the same thing SMS
+                # and voice do — including the 911 redirect on life-safety
+                # reports and a location prompt when geocoding failed.
+                reply = data.get("reply") or f"Incident **#{incident_id}** created — {cat} near {short_addr}"
+                if data.get("life_safety"):
+                    await message.add_reaction("🚨")
+                await message.reply(reply, mention_author=False)
             else:
                 await message.add_reaction("❌")
 

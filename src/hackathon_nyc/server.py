@@ -21,6 +21,7 @@ from pathlib import Path
 
 from hackathon_nyc import db
 from hackathon_nyc import policy
+from hackathon_nyc import intake
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +376,7 @@ def get_incident_history(incident_id: str):
 @app.get("/api/urgency/{text}")
 def score_urgency(text: str):
     """Score the urgency of arbitrary text. Used by the frontend for display."""
-    score, label = compute_urgency(text.lower())
+    score, label = intake.score_urgency(text)
     return {"urgency_score": score, "urgency_label": label}
 
 
@@ -445,222 +446,36 @@ def check_alerts_for_incident(incident_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Natural Language Urgency Scoring
-# ---------------------------------------------------------------------------
-
-URGENCY_KEYWORDS = {
-    "critical": [
-        "trapped", "emergency", "can't get out", "cant get out", "fire",
-        "collapse", "collapsed", "gas leak", "children", "child", "kid",
-        "elderly", "disabled", "unconscious", "drowning", "stuck inside",
-        "can't breathe", "cant breathe", "explosion", "electrocution",
-        "building falling", "structural collapse", "life threatening",
-    ],
-    "high": [
-        "flooded basement", "no heat elderly", "structural damage",
-        "large", "severe", "dangerous", "blocked road", "power out",
-        "no electricity", "ceiling caving", "sewage overflow",
-        "major", "massive", "water rising", "chest deep", "waist deep",
-        "no heat", "no hot water", "carbon monoxide", "mold black",
-    ],
-    "medium": [
-        "flooding", "broken", "leak", "backed up", "smell", "noise all night",
-        "clogged", "overflowing", "puddle", "crack", "damage",
-        "standing water", "dripping", "buzzing", "banging",
-    ],
-    "low": [
-        "small", "minor", "little", "slight", "tiny",
-    ],
-}
-
-URGENCY_SCORES = {"critical": 1.0, "high": 0.8, "medium": 0.5, "low": 0.2}
-
-
-def compute_urgency(text_lower: str) -> tuple[float, str]:
-    """Score the urgency of a citizen report based on keyword matching.
-    Returns (score, label) where score is 0.0-1.0 and label is CRITICAL/HIGH/MEDIUM/LOW."""
-    best_score = 0.2
-    best_label = "LOW"
-    hit_count = 0
-
-    for level in ["critical", "high", "medium", "low"]:
-        for kw in URGENCY_KEYWORDS[level]:
-            if kw in text_lower:
-                score = URGENCY_SCORES[level]
-                hit_count += 1
-                if score > best_score:
-                    best_score = score
-                    best_label = level.upper()
-
-    # Boost slightly for multiple keyword hits (compound urgency)
-    if hit_count >= 3 and best_score < 1.0:
-        best_score = min(1.0, best_score + 0.1)
-    if hit_count >= 5 and best_score < 1.0:
-        best_score = min(1.0, best_score + 0.1)
-
-    return round(best_score, 2), best_label
-
-
-# ---------------------------------------------------------------------------
-# OpenClaw / Discord Webhook — accepts messages, creates incidents
+# Citizen intake — every channel converges here
+#
+# Classification, urgency scoring, transcript repair and address extraction
+# used to live inline in this endpoint, with near-copies in twilio_voice.py,
+# discord_bot.py and monitor_agent.py. They now live once, in intake.py.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/webhook/report")
 async def webhook_report(request: Request):
-    """Accept a report from any source (OpenClaw, Discord bot, etc).
-    Body: { "message": "flooding at 200 Broadway Manhattan", "source": "discord", "user": "Colin#1234" }
-    Geocodes the message, creates an incident, returns the result.
-    """
-    import aiohttp
-    data = await request.json()
-    message = data.get("message", "")
-    source = data.get("source", "citizen_discord")
-    user = data.get("user", "unknown")
+    """Accept a citizen report from any channel.
 
+    Body: {"message": "flooding at 200 Broadway", "source": "discord", "user": "..."}
+    Optional "latitude"/"longitude" skip geocoding when the caller already knows.
+    """
+    data = await request.json()
+    message = (data.get("message") or "").strip()
     if not message:
         return {"error": "No message provided"}
 
-    # Geocode: extract address from message
-    lat, lon, address = None, None, ""
-    try:
-        from hackathon_nyc.tools.geocoding import geocode_address
-        import re
-
-        # Clean common transcription errors
-        import re as _re
-        fixed = _re.sub(r'\s+', ' ', message).strip()  # normalize whitespace
-        fixed = fixed.replace(' and ', ' & ').replace(' AND ', ' & ')
-        fixed = _re.sub(r'\.', ' ', fixed)  # remove ALL periods (STT adds them randomly)
-        fixed = _re.sub(r'\s+', ' ', fixed).strip()  # re-normalize after period removal
-        fixed = _re.sub(r'\b[Bb]looding\b', 'flooding', fixed)  # common Whisper error
-        fixed = _re.sub(r'\b[Bb]leeding\b', 'flooding', fixed)  # another Whisper error
-        fixed = _re.sub(r'\bin\b', ',', fixed)  # "in Manhattan" → ", Manhattan"
-        fixed = _re.sub(r'\s+', ' ', fixed).strip()
-        fixed = _re.sub(r'\$(\d+)\.00', r'\1', fixed)  # "$350.00" → "350"
-        fixed = _re.sub(r'\$(\d+)', r'\1', fixed)       # "$350" → "350"
-        # Fix Whisper merging "350 5th" → "355th": generate alternate split versions
-        alt_splits = []
-        for m in _re.finditer(r'\b(\d{3,})(st|nd|rd|th)\b', fixed, _re.IGNORECASE):
-            num = m.group(1)
-            suffix = m.group(2)
-            # Try splitting at each position: "355" → "35 5", "3 55"
-            for i in range(len(num)-1, 0, -1):
-                left = num[:i]
-                right = num[i:]
-                right_suffix = {'1':'st','2':'nd','3':'rd'}.get(right[-1], 'th')
-                alt = fixed[:m.start()] + left + ' ' + right + right_suffix + fixed[m.end():]
-                alt_splits.append(alt)
-
-        # Strategy 1: grab everything after the LAST "at"/"near"/"around", stop at noise
-        after_prep = ""
-        for prep in [' at ', ' near ', ' around ']:
-            idx = fixed.lower().rfind(prep)
-            if idx != -1:
-                after_prep = fixed[idx + len(prep):].strip()
-                # Cut at noise words that aren't part of the address
-                cut = _re.search(r'\b(its?|it\'s|the water|water is|very|really|severe|bad|terrible|about|deep|inches|feet|foot|please|help|send|someone|nobody|done)\b', after_prep, _re.IGNORECASE)
-                if cut:
-                    after_prep = after_prep[:cut.start()].strip()
-                    after_prep = _re.sub(r'[\s,]+$', '', after_prep)
-                break
-
-        # Strategy 2: try multiple approaches
-        queries = []
-        if after_prep:
-            queries.append(after_prep + ', New York, NY')
-        # Strategy 3: split on periods and strip noise words from each chunk
-        noise = r'\b(flooding|flood|noise|loud|rats?|sewer|pothole|crash|heat|construction|report|there is|water|tree|fell|broken|damaged|its?|severe|bad|terrible|really|very|about|deep|inches|feet|foot)\b'
-        for chunk in _re.split(r'[.!?]+', fixed):
-            chunk = chunk.strip()
-            if len(chunk) > 5 and any(c.isdigit() for c in chunk):
-                clean_chunk = _re.sub(noise, ' ', chunk, flags=_re.IGNORECASE)
-                clean_chunk = _re.sub(r'\s+', ' ', clean_chunk).strip()
-                clean_chunk = _re.sub(r'^[\s,&]+|[\s,&]+$', '', clean_chunk)
-                if len(clean_chunk) > 3:
-                    queries.append(clean_chunk + ', New York, NY')
-                queries.append(chunk + ', New York, NY')
-        # Strategy 4: try split alternatives for merged ordinals
-        for alt in alt_splits:
-            queries.append(alt + ', New York, NY')
-        queries.append(fixed + ', New York, NY')
-        queries.append(message + ', New York, NY')
-
-        for query in queries:
-            if len(query) < 10:
-                continue
-            # Force NYC bounding box to prevent Buffalo/other city matches
-            geo = await geocode_address(query)
-            if "error" not in geo:
-                # Verify it's in NYC proper (5 boroughs only)
-                qlat, qlon = geo["lat"], geo["lon"]
-                if 40.49 <= qlat <= 40.92 and -74.26 <= qlon <= -73.68:
-                    lat, lon = qlat, qlon
-                    address = geo.get("display_name", "")
-                    break
-                # Not in NYC — skip this result and try next query
-    except Exception:
-        pass
-
-    # Guess category from keywords
-    msg_lower = message.lower()
-    category = "other"
-    for keyword, cat in [("flood", "flooding"), ("water main", "flooding"), ("sewer", "sewer"),
-                         ("gas leak", "sewer"), ("gas smell", "sewer"), ("noise", "noise"),
-                         ("loud", "noise"), ("music", "noise"), ("party", "noise"),
-                         ("rat", "rodent"), ("mouse", "rodent"), ("roach", "rodent"), ("pest", "rodent"),
-                         ("heat", "heat"), ("hot water", "heat"), ("no heat", "heat"),
-                         ("pothole", "street_condition"), ("road", "street_condition"), ("crack", "street_condition"),
-                         ("crash", "street_condition"), ("accident", "street_condition"),
-                         ("tree", "tree"), ("branch", "tree"),
-                         ("water", "water"), ("hydrant", "water"), ("leak", "water"),
-                         ("fire", "other"), ("smoke", "other"), ("construction", "noise")]:
-        if keyword in msg_lower:
-            category = cat
-            break
-
-    # --- Natural Language Urgency Scoring ---
-    urgency_score, urgency_label = compute_urgency(msg_lower)
-    # Map urgency to severity
-    if urgency_score >= 0.9:
-        severity = "critical"
-    elif urgency_score >= 0.7:
-        severity = "high"
-    elif urgency_score >= 0.4:
-        severity = "medium"
-    else:
-        severity = "low"
-
-    incident = db.create_incident(
-        title=message[:60],
-        category=category,
-        description=f"Report from {user}: {message}",
-        severity=severity,
-        source=f"citizen_{source}",
-        latitude=lat, longitude=lon, address=address,
+    result = await intake.process_report(
+        text=message,
+        source=data.get("source", "web"),
+        user=data.get("user", "unknown"),
+        latitude=data.get("latitude"),
+        longitude=data.get("longitude"),
     )
-    # Attach urgency metadata to response
-    incident["urgency_score"] = urgency_score
-    incident["urgency_label"] = urgency_label
-
-    # Notify nearby subscribers — but only if the policy gate allows it.
-    #
-    # This used to text everyone in range the moment an incident was created,
-    # with no confirmation check, so every citizen report bypassed the
-    # anti-spam rule. A single false report produced real outbound SMS.
-    decision = policy.evaluate_alert(incident["id"])
-    incident["alert_decision"] = decision.as_dict()
-    if decision.allowed and decision.recipients:
-        sent = await _send_alerts(
-            decision.recipients,
-            f"⚠️ GRIDWATCH ALERT: {category.upper()} reported near {address[:60]}. "
-            f"{urgency_label} severity. #{incident['id'][:8]}",
-        )
-        incident["alerts_sent"] = sent
-    else:
-        incident["alerts_sent"] = 0
-        logger.info("[Alert] Suppressed for #%s: %s", incident["id"][:8], decision.reason)
-
-    return incident
+    return {**result.incident,
+            "reply": result.reply(),
+            "needs_location": result.needs_location,
+            "life_safety": result.life_safety}
 
 
 # ---------------------------------------------------------------------------
