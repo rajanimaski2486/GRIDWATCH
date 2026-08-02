@@ -2,6 +2,14 @@
 
 Date: 2026-07-30
 
+> **Status note.** These three documents describe the system *as it was found*
+> and the plan that followed. Most of that plan has since landed: retrieval no
+> longer uses ChromaDB (it is a hosted OpenSearch index behind a custom NAT
+> retriever provider), inference runs on NVIDIA-hosted Nemotron, and the NAT
+> workflow is the live path. Read them as the diagnosis and the plan; read
+> `TESTING.md` and `DEPLOY.md` for how the system works today.
+
+
 ## Executive Summary
 
 GridWatch has the right ingredients for an agentic urban operations system: live NYC data tools, a local Nemotron model, NeMo Agent Toolkit configuration, ChromaDB retrieval, citizen input channels, incident state, alert subscriptions, and a background monitor. The main architectural issue is that these pieces are not yet operating as one agentic workflow.

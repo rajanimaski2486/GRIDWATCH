@@ -6,6 +6,14 @@ Mac-specific setup and public hosting.
 
 Companions: `architecture_review.md` (internal agent design), `NAT_DEPLOYMENT_PLAN.md` (deploy).
 
+> **Status note.** These three documents describe the system *as it was found*
+> and the plan that followed. Most of that plan has since landed: retrieval no
+> longer uses ChromaDB (it is a hosted OpenSearch index behind a custom NAT
+> retriever provider), inference runs on NVIDIA-hosted Nemotron, and the NAT
+> workflow is the live path. Read them as the diagnosis and the plan; read
+> `TESTING.md` and `DEPLOY.md` for how the system works today.
+
+
 ---
 
 # Part 1 — What GridWatch actually is

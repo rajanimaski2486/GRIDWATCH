@@ -1,16 +1,18 @@
-"""Index NYC Open Data into OpenSearch with NVIDIA NIM embeddings.
+"""Download NYC Open Data and index it into OpenSearch with NIM embeddings.
 
-Replaces the ChromaDB path in ingest.py. Two things change beyond the backend:
+Replaces the ChromaDB ingest this project used to carry. Two things change
+beyond the backend:
 
 1. One document per record, not five records mashed into a text blob. The old
-   chunking forced historical_lookup.py to regex lat/lon back out of
-   concatenated text; here coordinates are real indexed fields.
+   chunking forced the retrieval tool to regex lat/lon back out of concatenated
+   text; here coordinates are real indexed fields.
 2. Embeddings come from nv-embedqa-e5-v5 (1024 dims) rather than the MiniLM
-   ONNX model ChromaDB downloads locally.
+   ONNX model ChromaDB downloaded locally.
 
 Usage:
     export NVIDIA_API_KEY=...  OPENSEARCH_URL=...
     python -m hackathon_nyc.ingest_opensearch --all
+    python -m hackathon_nyc.ingest_opensearch --all --download   # refresh from NYC first
     python -m hackathon_nyc.ingest_opensearch --datasets 311_current --limit 300
 """
 
@@ -40,6 +42,34 @@ LOCAL_DATASETS = {
 # Per-dataset coordinate field names. NYC Open Data is not consistent.
 LAT_FIELDS = ("latitude", "lat", "y_coord", "start_lat")
 LON_FIELDS = ("longitude", "lon", "lng", "x_coord", "start_lon")
+
+
+async def download_dataset(key: str, limit: int = 10000) -> Path | None:
+    """Fetch a dataset from NYC Open Data via SODA and cache it under data/.
+
+    Carried over from the ChromaDB-era ingest module, which is otherwise gone.
+    """
+    import aiohttp
+    from hackathon_nyc.tools.nyc_opendata import NYC_OPENDATA_BASE, DATASETS
+
+    dataset_id = DATASETS.get(key)
+    if not dataset_id:
+        print(f"  unknown dataset '{key}' — not in nyc_opendata.DATASETS")
+        return None
+
+    out = DATA_DIR / LOCAL_DATASETS.get(key, f"{key}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{NYC_OPENDATA_BASE}/{dataset_id}.json",
+                         params={"$limit": str(limit)},
+                         timeout=aiohttp.ClientTimeout(total=300)) as r:
+            if r.status != 200:
+                print(f"  download failed [{r.status}] for {key}")
+                return None
+            data = await r.json()
+    out.write_text(json.dumps(data, indent=2, default=str))
+    print(f"  downloaded {len(data)} records -> {out.name}")
+    return out
 
 
 def _client():
@@ -218,6 +248,8 @@ async def main():
     p.add_argument("--all", action="store_true")
     p.add_argument("--limit", type=int, default=300, help="Max records per dataset")
     p.add_argument("--recreate", action="store_true", help="Drop and rebuild each index")
+    p.add_argument("--download", action="store_true",
+                   help="Refresh the local JSON from NYC Open Data before indexing")
     args = p.parse_args()
 
     api_key = os.getenv("NVIDIA_API_KEY", "")
@@ -234,8 +266,11 @@ async def main():
     total = 0
     for key in keys:
         path = DATA_DIR / LOCAL_DATASETS.get(key, f"{key}.json")
+        if args.download or not path.exists():
+            print(f"[{key}] fetching from NYC Open Data")
+            path = await download_dataset(key, limit=max(args.limit, 1000)) or path
         if not path.exists():
-            print(f"[{key}] SKIP — {path} not found")
+            print(f"[{key}] SKIP — {path} not found (try --download)")
             continue
         records = json.loads(path.read_text())[:args.limit]
         print(f"[{key}] {len(records)} records")
