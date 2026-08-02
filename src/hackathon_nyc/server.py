@@ -74,7 +74,7 @@ async def _send_alerts(recipients: list, body: str) -> int:
 _nemo_workflow = None
 _nemo_builder_ctx = None
 _nemo_builder = None
-_chroma_collection = None
+_rag_status: dict = {"backend": "none", "reachable": False, "docs": 0, "detail": ""}
 
 
 _nat_status: dict = {"state": "not_started", "detail": "", "config": "", "tools": 0}
@@ -140,25 +140,31 @@ async def _init_nemo_agent():
         logger.error("[NAT] Build failed — serving in degraded mode: %s", e)
 
 
-def _init_rag():
-    """Initialize ChromaDB RAG for context retrieval."""
-    global _chroma_collection
+def _check_rag() -> dict:
+    """Report OpenSearch index health for the dashboard status panel.
+
+    Retrieval itself runs inside the NAT workflow via the opensearch_retriever;
+    this only answers "is the index reachable and does it have documents".
+    """
+    url = os.getenv("OPENSEARCH_URL", "")
+    if not url:
+        return {"backend": "none", "reachable": False, "docs": 0,
+                "detail": "OPENSEARCH_URL not set — historical search is unavailable."}
     try:
-        import chromadb
-        db_path = Path(__file__).parent.parent.parent / "data" / "chromadb"
-        if db_path.exists():
-            client = chromadb.PersistentClient(path=str(db_path))
-            collections = client.list_collections()
-            if collections:
-                _chroma_collection = client.get_collection(collections[0].name)
-                logger.info("[RAG] ChromaDB loaded: %s (%d documents)",
-                           _chroma_collection.name, _chroma_collection.count())
-            else:
-                logger.info("[RAG] ChromaDB exists but no collections. Run: python -m hackathon_nyc.ingest --all")
-        else:
-            logger.info("[RAG] No ChromaDB found. Run: python -m hackathon_nyc.ingest --all")
+        from opensearchpy import OpenSearch
+        kwargs = {"hosts": [url], "verify_certs": os.getenv("OPENSEARCH_VERIFY_CERTS", "true") != "false"}
+        user, password = os.getenv("OPENSEARCH_USER", ""), os.getenv("OPENSEARCH_PASSWORD", "")
+        if user and password and "@" not in url.split("//", 1)[-1]:
+            kwargs["http_auth"] = (user, password)
+        client = OpenSearch(**kwargs)
+        prefix = os.getenv("OPENSEARCH_INDEX_PREFIX", "nyc_")
+        stats = client.count(index=f"{prefix}*")
+        return {"backend": "opensearch", "reachable": True,
+                "docs": int(stats.get("count", 0)), "detail": ""}
     except Exception as e:
-        logger.error("[RAG] Failed to initialize: %s", e)
+        logger.error("[RAG] OpenSearch unreachable: %s", e)
+        return {"backend": "opensearch", "reachable": False, "docs": 0,
+                "detail": f"{type(e).__name__}: {e}"}
 
 
 async def _shutdown_nemo_agent():
@@ -176,7 +182,8 @@ async def _shutdown_nemo_agent():
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     await _init_nemo_agent()
-    _init_rag()
+    global _rag_status
+    _rag_status = _check_rag()
     # Monitor stays disabled until incident mutation goes through the policy
     # gate — see architecture_review.md §4 and NAT_DEPLOYMENT_PLAN.md phase 4.
     # Enable with GRIDWATCH_MONITOR=1 once that lands.
@@ -805,6 +812,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
 CHAT_HISTORY: list[dict] = []
 
+# Guards the module-level map-point buffer in register.py for the duration of a
+# workflow run. Concurrent dispatcher questions queue rather than interleave.
+_generate_lock = asyncio.Lock()
+
 
 @app.get("/api/agent/status")
 def agent_status():
@@ -815,8 +826,10 @@ def agent_status():
         "detail": _nat_status["detail"],        # why, when degraded
         "config": _nat_status["config"],        # which YAML is live
         "tools": _nat_status["tools"],
-        "rag": _chroma_collection is not None,
-        "rag_docs": _chroma_collection.count() if _chroma_collection else 0,
+        "rag": _rag_status["reachable"],
+        "rag_backend": _rag_status["backend"],
+        "rag_docs": _rag_status["docs"],
+        "rag_detail": _rag_status["detail"],
         "mode": "nat" if _nemo_workflow else "degraded_readonly",
     }
 
@@ -870,6 +883,14 @@ async def generate_chat(request: Request):
 
     from hackathon_nyc.register import reset_map_points, get_map_points
 
+    # Serialized: the map-point buffer the history tools write to is module
+    # level, because NAT runs tools in a context the request handler cannot
+    # reach. See the note in register.py.
+    async with _generate_lock:
+        return await _run_workflow(user_input, reset_map_points, get_map_points)
+
+
+async def _run_workflow(user_input: str, reset_map_points, get_map_points) -> dict:
     reset_map_points()
     try:
         from nat.data_models.api_server import ChatRequest, Message, UserMessageContentRoleType

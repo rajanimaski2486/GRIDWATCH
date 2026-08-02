@@ -9,7 +9,6 @@ Registers four function groups + one parallel executor:
 """
 
 import asyncio
-import contextvars
 import json
 from collections.abc import AsyncGenerator
 
@@ -19,12 +18,13 @@ from nat.builder.builder import Builder
 from nat.builder.function import FunctionGroup
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function, register_function_group
-from nat.data_models.component_ref import FunctionRef
+from nat.data_models.component_ref import FunctionRef, RetrieverRef
 from nat.data_models.function import FunctionBaseConfig, FunctionGroupBaseConfig
 
-from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding, historical_lookup
+from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding
 from hackathon_nyc import db
 from hackathon_nyc import policy
+from hackathon_nyc import retrievers  # noqa: F401  (registers opensearch_retriever)
 
 
 # ---------------------------------------------------------------------------
@@ -36,25 +36,32 @@ from hackathon_nyc import policy
 # fallback did), the tool records what it found here and /generate reads it
 # after the workflow completes.
 #
-# The ContextVar holds a mutable list and tools EXTEND it rather than calling
-# .set(). A ContextVar assignment inside a child task is invisible to the
-# parent — context propagates down, not back up — but the list object itself is
-# shared, so in-place mutation is seen by the request handler. Each request
-# installs a fresh list, which keeps concurrent requests isolated.
+# This is a plain module-level list, and /generate holds a lock across the
+# whole workflow run so only one request fills it at a time.
+#
+# A ContextVar was tried first and does not work here: NAT executes tools in a
+# context unrelated to the caller's, so a value set in the request handler is
+# invisible inside the tool — and `Context.get().workflow_run_id` is None on the
+# caller's side, so there is no shared key to correlate on either. Both were
+# verified, not assumed.
+#
+# The cost is that concurrent /generate calls serialize. For a dispatcher
+# console that is acceptable; the honest alternative is to read tool outputs
+# from NAT's intermediate step stream, which `Workflow.result_with_steps()`
+# should provide but which raises "await wasn't used with future" in 1.8.0.
 # ---------------------------------------------------------------------------
-_MAP_POINTS: contextvars.ContextVar[list] = contextvars.ContextVar("gridwatch_map_points", default=[])
+_MAP_POINTS: list = []
 
 
 def reset_map_points() -> list:
-    """Install a fresh point buffer for this request and return it."""
-    buf: list = []
-    _MAP_POINTS.set(buf)
-    return buf
+    """Clear the point buffer. Call under the lock, before invoking the workflow."""
+    _MAP_POINTS.clear()
+    return _MAP_POINTS
 
 
 def get_map_points() -> list:
-    """Return map points recorded by history tools during this request."""
-    return list(_MAP_POINTS.get())
+    """Return map points recorded by history tools during the last run."""
+    return list(_MAP_POINTS)
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +225,13 @@ async def nyc_geo_tools(_config: GeoToolConfig, _builder: Builder) -> AsyncGener
         nearest = geocoding.find_nearest_points(lat, lon, sensors, top_n)
         return json.dumps(nearest, indent=2, default=str)
 
-    async def _historical_lookup(query: str, k: int = 5) -> str:
-        """RAG: search NYC Open Data history (311, collisions, potholes, rats, housing, floods) for context relevant to the query. Use this for any question about past incidents, trends, or what happened before in a neighborhood."""
-        result = await historical_lookup.historical_lookup(query, k=k)
-        return json.dumps(result, indent=2, default=str)
+    # A `historical_lookup` tool used to be registered here against ChromaDB.
+    # It was already excluded by the include list above, so nothing could call
+    # it; retrieval now lives in nyc_history_tools over OpenSearch.
 
     group.add_function(name="geocode_address", fn=_geocode_address, description=_geocode_address.__doc__)
     group.add_function(name="reverse_geocode", fn=_reverse_geocode, description=_reverse_geocode.__doc__)
     group.add_function(name="find_nearest_sensors", fn=_find_nearest_sensors, description=_find_nearest_sensors.__doc__)
-    group.add_function(name="historical_lookup", fn=_historical_lookup, description=_historical_lookup.__doc__)
 
     yield group
 
@@ -439,58 +444,75 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
 # exposed as an ordinary function group instead of a `retrievers:` block.
 # ---------------------------------------------------------------------------
 
+TOPIC_INDICES = {
+    "flood": "nyc_flood_events",
+    "rodent": "nyc_rodent_inspections",
+    "pothole": "nyc_potholes",
+    "collision": "nyc_collisions",
+    "housing": "nyc_housing_violations",
+    "311": "nyc_311_current",
+}
+
+
 class HistoryToolConfig(FunctionGroupBaseConfig, name="nyc_history_tools"):
+    retriever: RetrieverRef = Field(
+        description="Retriever holding the historical NYC Open Data indices",
+    )
+    top_k: int = Field(default=6, gt=0, description="Records to return per search")
     include: list[str] = Field(
         default_factory=lambda: [
             "search_history",
             "search_history_by_topic",
         ],
-        description="Historical NYC Open Data retrieval over local ChromaDB collections",
+        description="Historical NYC Open Data retrieval",
     )
 
 
 @register_function_group(config_type=HistoryToolConfig)
 async def nyc_history_tools(_config: HistoryToolConfig, _builder: Builder) -> AsyncGenerator[FunctionGroup, None]:
     group = FunctionGroup(config=_config)
+    retriever = await _builder.get_retriever(_config.retriever)
 
-    def _record_points(result: dict) -> None:
-        points = result.get("points") or []
+    def _format(docs, **extra) -> str:
+        """Render results for the agent and record map points as a side effect.
+
+        Coordinates come from indexed `lat`/`lon` fields. The ChromaDB version
+        had to regex them back out of concatenated chunk text, because it
+        stored five records per document with no structured metadata.
+        """
+        records, points = [], []
+        for d in docs:
+            meta = d.metadata or {}
+            records.append({
+                "source": meta.get("dataset") or meta.get("_index", ""),
+                "date": meta.get("date", ""),
+                "text": d.page_content[:300],
+            })
+            lat, lon = meta.get("lat"), meta.get("lon")
+            if lat is not None and lon is not None:
+                points.append({
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "collection": meta.get("_index") or meta.get("dataset", ""),
+                    "label": (meta.get("label") or d.page_content)[:120],
+                })
         if points:
-            _MAP_POINTS.get().extend(points)  # in-place: see note at top of file
+            _MAP_POINTS.extend(points)
+        return json.dumps({"found": len(records), "records": records, **extra},
+                          indent=2, default=str)
 
     async def _search_history(query: str) -> str:
         """Search historical NYC Open Data records (311 complaints, collisions, potholes, rodent inspections, housing violations, flood events) for anything relevant to the query. Use this for questions about the past, trends, repeat locations, or whether something has happened before."""
-        result = await historical_lookup.historical_lookup(query, k=6)
-        _record_points(result)
-        chunks = result.get("results", [])
-        if not chunks:
-            return json.dumps({"found": 0, "message": "No historical records matched."})
-        return json.dumps({
-            "found": len(chunks),
-            "records": [{"collection": c["collection"], "text": c["text"][:300]} for c in chunks],
-        }, indent=2, default=str)
+        out = await retriever.search(query, top_k=_config.top_k)
+        return _format(out.results)
 
     async def _search_history_by_topic(query: str, topic: str) -> str:
         """Search historical NYC records limited to one topic. topic must be one of: flood, rodent, pothole, collision, housing, 311. Use when the question is clearly about a single domain."""
-        topic_map = {
-            "flood": ["nyc_flood_events"],
-            "rodent": ["nyc_rodent_inspections"],
-            "pothole": ["nyc_potholes"],
-            "collision": ["nyc_collisions"],
-            "housing": ["nyc_housing_violations"],
-            "311": ["nyc_311_current"],
-        }
-        collections = topic_map.get(topic.strip().lower())
-        if collections is None:
-            return json.dumps({"error": f"Unknown topic '{topic}'. Use one of: {', '.join(topic_map)}"})
-        result = await historical_lookup.historical_lookup(query, k=6, collections=collections)
-        _record_points(result)
-        chunks = result.get("results", [])
-        return json.dumps({
-            "found": len(chunks),
-            "topic": topic,
-            "records": [{"collection": c["collection"], "text": c["text"][:300]} for c in chunks],
-        }, indent=2, default=str)
+        index = TOPIC_INDICES.get(topic.strip().lower())
+        if index is None:
+            return json.dumps({"error": f"Unknown topic '{topic}'. Use one of: {', '.join(TOPIC_INDICES)}"})
+        out = await retriever.search(query, index_name=index, top_k=_config.top_k)
+        return _format(out.results, topic=topic)
 
     group.add_function(name="search_history", fn=_search_history, description=_search_history.__doc__)
     group.add_function(name="search_history_by_topic", fn=_search_history_by_topic, description=_search_history_by_topic.__doc__)

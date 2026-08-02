@@ -12,7 +12,7 @@
 
 FROM python:3.12-slim
 
-# build-essential is needed for chromadb's native deps; removed after install
+# build-essential is needed by a few native wheels; removed after install
 # to keep the layer small.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential curl \
@@ -32,22 +32,16 @@ RUN pip install --no-cache-dir -e ".[observability]" \
 
 COPY src ./src
 
-# Read-only RAG index (~69 MB). The committed ChromaDB was built with Chroma's
-# default embedder, which downloads an 80 MB ONNX model on first query — bake
-# it in now so the first user request isn't paying for that download.
-COPY data/chromadb ./data/chromadb
-RUN python -c "\
-import chromadb; \
-c = chromadb.PersistentClient(path='data/chromadb'); \
-cols = c.list_collections(); \
-print('collections:', [x.name for x in cols]); \
-cols and c.get_collection(cols[0].name).query(query_texts=['warmup'], n_results=1)"
+# No vector index in the image any more. Historical search lives in a hosted
+# OpenSearch cluster (OPENSEARCH_URL) and embeddings come from the NIM, which
+# removed ChromaDB's 69 MB index and its 167 MB local ONNX model.
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=7860 \
     NAT_CONFIG=/app/src/hackathon_nyc/configs/config_gridwatch.yml \
-    GRIDWATCH_DATA_DIR=/app/data
+    GRIDWATCH_DATA_DIR=/app/data \
+    OPENSEARCH_INDEX_PREFIX=nyc_
 
 # Fail the build if NAT can't discover the tool groups — a broken entry point
 # should not become a running container. Introspect the registry rather than
