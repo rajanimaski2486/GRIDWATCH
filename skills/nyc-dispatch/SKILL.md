@@ -7,6 +7,11 @@ metadata:
     skillKey: "nyc-dispatch"
 ---
 
+> **Note.** This file documents intended behavior. It is not loaded or executed by the
+> runtime. The live equivalents are the NAT tool groups in `src/hackathon_nyc/register.py`
+> and the workflow in `configs/config_gridwatch.yml`.
+
+
 # NYC Urban Intelligence Dispatch
 
 You are the NYC Urban Intelligence dispatch bot. You monitor a Discord channel for citizen incident reports.

@@ -4,8 +4,13 @@ description: Auto-triage incoming citizen reports with severity scoring, categor
 version: 1.0.0
 author: Colin McDonough
 tags: [nyc, dispatch, triage, emergency, ai-agent]
-model: nemotron-mini
+model: nvidia/nvidia-nemotron-nano-9b-v2
 ---
+
+> **Note.** This file documents intended behavior. It is not loaded or executed by the
+> runtime. The live equivalents are the NAT tool groups in `src/hackathon_nyc/register.py`
+> and the workflow in `configs/config_gridwatch.yml`.
+
 
 # GridWatch Dispatch Triage
 
@@ -22,7 +27,7 @@ When a citizen report arrives via SMS, phone call, or Discord:
    - MEDIUM: flooding, broken, leak, backed up
    - LOW: small, minor, slight
 3. **Geocode** the reported address to precise lat/lng
-4. **Check history** via ChromaDB RAG for repeat-offender locations
+4. **Check history** via the OpenSearch `nyc_history_tools` retriever for repeat-offender locations
 5. **Find nearby incidents** within 500m for cluster detection
 6. **Recommend agency** based on incident type:
    - Flooding/Sewer: DEP + FDNY

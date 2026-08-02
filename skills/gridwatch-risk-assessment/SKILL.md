@@ -4,8 +4,13 @@ description: Analyze neighborhood infrastructure risk for any NYC address using 
 version: 1.0.0
 author: Colin McDonough
 tags: [nyc, infrastructure, risk, safety, urban-intelligence]
-model: nemotron-mini
+model: nvidia/nvidia-nemotron-nano-9b-v2
 ---
+
+> **Note.** This file documents intended behavior. It is not loaded or executed by the
+> runtime. The live equivalents are the NAT tool groups in `src/hackathon_nyc/register.py`
+> and the workflow in `configs/config_gridwatch.yml`.
+
 
 # GridWatch Risk Assessment
 
@@ -54,4 +59,4 @@ risk score for 125 Canal Street Manhattan
 - All queried in real-time using Socrata within_circle geo-filter
 
 ## Hardware
-Runs on NVIDIA GB10 Grace Blackwell with Nemotron-Mini 4.2B via Ollama.
+Reasoning runs on NVIDIA-hosted Nemotron NIMs (build.nvidia.com); no local GPU required.

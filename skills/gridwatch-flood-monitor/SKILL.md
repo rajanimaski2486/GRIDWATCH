@@ -4,8 +4,13 @@ description: Monitor NYC FloodNet sensors and predict flood risk using cross-cor
 version: 1.0.0
 author: Colin McDonough
 tags: [nyc, flooding, prediction, sensors, climate]
-model: nemotron-mini
+model: nvidia/nvidia-nemotron-nano-9b-v2
 ---
+
+> **Note.** This file documents intended behavior. It is not loaded or executed by the
+> runtime. The live equivalents are the NAT tool groups in `src/hackathon_nyc/register.py`
+> and the workflow in `configs/config_gridwatch.yml`.
+
 
 # GridWatch Flood Monitor
 
