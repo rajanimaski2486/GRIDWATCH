@@ -56,6 +56,7 @@ function_groups:
   history_tools:                                   # 2 tools — OpenSearch RAG
     _type: nyc_history_tools
     retriever: history
+  analyst_tools:   { _type: nyc_analyst_tools }    # 3 tools — correlations, backtest, risk
 
 functions:
   current_datetime:
@@ -91,6 +92,17 @@ functions:
       rodents, heat/hot water, sewer, resident-reported problems, and the
       historical record of all of the above.
 
+  risk_analyst_agent:
+    _type: react_agent
+    llm_name: fast
+    tool_names: [analyst_tools, history_tools, geo_tools]
+    max_tool_calls: 8
+    parse_agent_response_max_retries: 3
+    description: >
+      Risk analyst. Cross-dataset correlation findings, prediction accuracy
+      from the backtest, and explainable 0-100 infrastructure risk scores for
+      an address.
+
   # Custom NAT function from register.py — runs both specialists concurrently.
   both_agents:
     _type: parallel_agent_query
@@ -124,9 +136,11 @@ workflow:
     - floodwatch_agent
     - command_center_agent
     - both_agents
+    - risk_analyst_agent
     - crm_tools
     - geo_tools
     - history_tools
+    - analyst_tools
     - current_datetime
   system_prompt: |
     You are GridWatch, the NYC Urban Intelligence dispatch system. You serve
@@ -139,6 +153,9 @@ workflow:
     - Incident create/update/resolve/confirm -> crm_tools
     - Dashboard counts and sitreps -> crm_tools get_incident_stats directly.
       Do not route a sitrep to a specialist.
+    - Risk of an address, why types cluster, what is predictable ->
+      risk_analyst_agent. Quote the correlation ratio and say what it means:
+      it compares against a random NYC point, not against zero.
     - Anything about the past, trends, or repeat locations -> history_tools.
       Summarize returned records in 2-4 plain sentences (top categories,
       boroughs, dates). Never paste raw JSON, coordinates or field names.

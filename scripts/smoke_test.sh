@@ -106,7 +106,7 @@ from nat.utils.data_models.schema_validator import validate_schema
 from nat.data_models.config import Config
 from nat.builder.workflow_builder import WorkflowBuilder
 
-GROUPS = ["flood_tools", "complaint_tools", "geo_tools", "crm_tools", "history_tools"]
+GROUPS = ["flood_tools", "complaint_tools", "geo_tools", "crm_tools", "history_tools", "analyst_tools"]
 
 async def main():
     cfg = validate_schema(yaml_load(Path(sys.argv[1])), Config)

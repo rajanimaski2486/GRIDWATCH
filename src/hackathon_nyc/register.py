@@ -521,6 +521,104 @@ async def nyc_history_tools(_config: HistoryToolConfig, _builder: Builder) -> As
 
 
 # ---------------------------------------------------------------------------
+# Analyst Tools
+#
+# correlation_analysis.py and backtest_predictions.py were terminal scripts —
+# real data work the agent had no way to reach. These expose them.
+# ---------------------------------------------------------------------------
+
+class AnalystToolConfig(FunctionGroupBaseConfig, name="nyc_analyst_tools"):
+    include: list[str] = Field(
+        default_factory=lambda: [
+            "get_correlation_findings",
+            "get_prediction_accuracy",
+            "explain_risk_score",
+        ],
+        description="Cross-dataset correlations, prediction backtest, risk scoring",
+    )
+
+
+@register_function_group(config_type=AnalystToolConfig)
+async def nyc_analyst_tools(_config: AnalystToolConfig, _builder: Builder) -> AsyncGenerator[FunctionGroup, None]:
+    from hackathon_nyc import analysis
+
+    group = FunctionGroup(config=_config)
+
+    async def _get_correlation_findings(topic: str = "") -> str:
+        """Cross-dataset correlation findings for NYC incident types, measured against a random baseline. Optionally filter by topic such as rodent, flooding, noise, housing, crash or pothole. Use when asked why incident types cluster, or what tends to co-occur with something."""
+        found = analysis.find_correlations(topic)
+        if not found:
+            return json.dumps({"found": 0,
+                               "message": f"No correlation findings for '{topic}'." if topic
+                               else "No correlation analysis available."})
+        return json.dumps({
+            "found": len(found),
+            "note": "Ratio is how much more often the second type appears within "
+                    "0.25 km of the first than near a random NYC point.",
+            "findings": [c.as_dict() for c in found[:6]],
+        }, indent=2, default=str)
+
+    async def _get_prediction_accuracy(complaint_type: str = "") -> str:
+        """How reliably the grid-based model predicts 311 complaints, from a backtest on 672k training and 158k test records. Optionally name a complaint type. Use when asked what can be predicted or how good the predictions are."""
+        data = analysis.load_backtest()
+        if not data.get("available"):
+            return json.dumps({"available": False, "message": "No backtest results available."})
+        if complaint_type:
+            needle = complaint_type.strip().lower()
+            matches = [t for t in data["by_type"] if needle in t["complaint_type"].lower()]
+            return json.dumps({
+                "complaint_type": complaint_type,
+                "matches": matches[:5],
+                "overall_hit_rate": data["overall_hit_rate"],
+                "caveat": data["caveat"],
+            }, indent=2, default=str)
+        return json.dumps({
+            "overall_hit_rate": data["overall_hit_rate"],
+            "false_positive_rate": data["false_positive_rate"],
+            "most_predictable": data["by_type"][:10],
+            "caveat": data["caveat"],
+        }, indent=2, default=str)
+
+    async def _explain_risk_score(address: str, radius_km: float = 0.8) -> str:
+        """Score infrastructure risk for a NYC address 0-100 and explain what drives it, using live incidents nearby. Use when asked how risky, dangerous or problem-prone a location is."""
+        geo = await geocoding.geocode_address(f"{address}, New York, NY")
+        if "error" in geo:
+            return json.dumps({"error": f"Could not geocode '{address}'"})
+        lat, lon = geo["lat"], geo["lon"]
+
+        # Count open incidents near the point, by category. geocoding's
+        # haversine returns MILES; the analysis and this tool speak km.
+        radius_miles = radius_km * 0.621371
+        counts: dict[str, int] = {}
+        for inc in db.list_incidents(limit=500):
+            ilat, ilon = inc.get("latitude"), inc.get("longitude")
+            if ilat is None or ilon is None:
+                continue
+            if geocoding.haversine_distance(lat, lon, ilat, ilon) <= radius_miles:
+                cat = inc.get("category", "other")
+                counts[cat] = counts.get(cat, 0) + 1
+
+        scored = analysis.score_from_counts(counts)
+        correlations = [c.as_dict() for c in analysis.load_correlations()
+                        if any(d in c.pair.lower() for d in scored["top_drivers"])][:2]
+        return json.dumps({
+            "address": geo.get("display_name", address),
+            "latitude": lat, "longitude": lon, "radius_km": radius_km,
+            **scored,
+            "related_correlations": correlations,
+        }, indent=2, default=str)
+
+    group.add_function(name="get_correlation_findings", fn=_get_correlation_findings,
+                       description=_get_correlation_findings.__doc__)
+    group.add_function(name="get_prediction_accuracy", fn=_get_prediction_accuracy,
+                       description=_get_prediction_accuracy.__doc__)
+    group.add_function(name="explain_risk_score", fn=_explain_risk_score,
+                       description=_explain_risk_score.__doc__)
+
+    yield group
+
+
+# ---------------------------------------------------------------------------
 # Parallel Agent Executor
 # Runs two sub-agents concurrently using asyncio.gather
 # ---------------------------------------------------------------------------
