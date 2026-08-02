@@ -10,11 +10,12 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 import os
+import secrets
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -197,13 +198,38 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="NYC Urban Intelligence System", version="2.0.0", lifespan=lifespan)
 
+# Lock CORS to the deployed dashboard when ALLOWED_ORIGINS is set. Left open
+# for local development, where the dashboard is served from this same app.
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional shared secret for state-changing routes. Unset (the default) leaves
+# the API open, which is fine locally and on a trusted network. Set it before
+# putting this on a public URL: without it, anyone who finds the deployment can
+# create, edit and delete incidents.
+DISPATCHER_TOKEN = os.getenv("GRIDWATCH_TOKEN", "")
+
+_MUTATING_PREFIXES = ("/api/incidents", "/api/alerts", "/api/webhook")
+
+
+@app.middleware("http")
+async def require_dispatcher_token(request: Request, call_next):
+    if DISPATCHER_TOKEN and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        path = request.url.path
+        # Twilio and Discord authenticate by their own means and cannot send
+        # this header; they are covered by the policy gate instead.
+        if path.startswith(_MUTATING_PREFIXES) and not path.startswith("/api/webhook/twilio"):
+            supplied = request.headers.get("X-GridWatch-Token", "")
+            if not secrets.compare_digest(supplied, DISPATCHER_TOKEN):
+                return JSONResponse({"detail": "Missing or invalid X-GridWatch-Token"},
+                                    status_code=401)
+    return await call_next(request)
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 

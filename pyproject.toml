@@ -40,6 +40,11 @@ channels = [
   "twilio>=9.0.0",
   "discord.py>=2.3.0",
 ]
+# Persist incidents outside the container. Required on hosts with an ephemeral
+# filesystem — set DATABASE_URL to a libSQL/Turso URL. See db.py.
+remote-db = [
+  "libsql-experimental>=0.0.40",
+]
 
 # This entry point is how `nat` discovers nyc_flood_tools, nyc_311_tools,
 # nyc_geo_tools, nyc_crm_tools and parallel_agent_query. Do not remove it.
