@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "mkdir -p .vercel_out && cp src/hackathon_nyc/frontend/index.html .vercel_out/index.html",
+  "outputDirectory": ".vercel_out",
+  "framework": null,
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://REPLACE-ME.hf.space/api/:path*" },
+    { "source": "/generate", "destination": "https://REPLACE-ME.hf.space/generate" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
+  ]
+}
