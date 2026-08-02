@@ -18,11 +18,50 @@ from nat.builder.builder import Builder
 from nat.builder.function import FunctionGroup
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function, register_function_group
-from nat.data_models.component_ref import FunctionRef
+from nat.data_models.component_ref import FunctionRef, RetrieverRef
 from nat.data_models.function import FunctionBaseConfig, FunctionGroupBaseConfig
 
-from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding, historical_lookup
+from hackathon_nyc.tools import nyc_opendata, floodnet, geocoding
 from hackathon_nyc import db
+from hackathon_nyc import policy
+from hackathon_nyc import retrievers  # noqa: F401  (registers opensearch_retriever)
+
+
+# ---------------------------------------------------------------------------
+# Map-point side channel
+#
+# The historical search tool returns prose to the agent, but the dashboard also
+# wants the underlying lat/lon records so it can plot them. Rather than
+# re-running retrieval in the server (which is what the old trigger-word
+# fallback did), the tool records what it found here and /generate reads it
+# after the workflow completes.
+#
+# This is a plain module-level list, and /generate holds a lock across the
+# whole workflow run so only one request fills it at a time.
+#
+# A ContextVar was tried first and does not work here: NAT executes tools in a
+# context unrelated to the caller's, so a value set in the request handler is
+# invisible inside the tool — and `Context.get().workflow_run_id` is None on the
+# caller's side, so there is no shared key to correlate on either. Both were
+# verified, not assumed.
+#
+# The cost is that concurrent /generate calls serialize. For a dispatcher
+# console that is acceptable; the honest alternative is to read tool outputs
+# from NAT's intermediate step stream, which `Workflow.result_with_steps()`
+# should provide but which raises "await wasn't used with future" in 1.8.0.
+# ---------------------------------------------------------------------------
+_MAP_POINTS: list = []
+
+
+def reset_map_points() -> list:
+    """Clear the point buffer. Call under the lock, before invoking the workflow."""
+    _MAP_POINTS.clear()
+    return _MAP_POINTS
+
+
+def get_map_points() -> list:
+    """Return map points recorded by history tools during the last run."""
+    return list(_MAP_POINTS)
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +92,9 @@ async def nyc_flood_tools(_config: FloodToolConfig, _builder: Builder) -> AsyncG
         result = await floodnet.get_active_floods(hours_back)
         return json.dumps(result[:20], indent=2, default=str)
 
-    async def _get_flood_sensors() -> str:
+    async def _get_flood_sensors(unused: str = "") -> str:
         """Get all FloodNet sensor deployment locations and coordinates across NYC."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = await floodnet.get_sensor_locations()
         return json.dumps(result, indent=2, default=str)
 
@@ -185,15 +225,13 @@ async def nyc_geo_tools(_config: GeoToolConfig, _builder: Builder) -> AsyncGener
         nearest = geocoding.find_nearest_points(lat, lon, sensors, top_n)
         return json.dumps(nearest, indent=2, default=str)
 
-    async def _historical_lookup(query: str, k: int = 5) -> str:
-        """RAG: search NYC Open Data history (311, collisions, potholes, rats, housing, floods) for context relevant to the query. Use this for any question about past incidents, trends, or what happened before in a neighborhood."""
-        result = await historical_lookup.historical_lookup(query, k=k)
-        return json.dumps(result, indent=2, default=str)
+    # A `historical_lookup` tool used to be registered here against ChromaDB.
+    # It was already excluded by the include list above, so nothing could call
+    # it; retrieval now lives in nyc_history_tools over OpenSearch.
 
     group.add_function(name="geocode_address", fn=_geocode_address, description=_geocode_address.__doc__)
     group.add_function(name="reverse_geocode", fn=_reverse_geocode, description=_reverse_geocode.__doc__)
     group.add_function(name="find_nearest_sensors", fn=_find_nearest_sensors, description=_find_nearest_sensors.__doc__)
-    group.add_function(name="historical_lookup", fn=_historical_lookup, description=_historical_lookup.__doc__)
 
     yield group
 
@@ -212,6 +250,17 @@ class CRMToolConfig(FunctionGroupBaseConfig, name="nyc_crm_tools"):
             "delete_incident",
             "get_incident",
             "get_incident_stats",
+            # Alert subscription + confirmation tools. These MUST stay included:
+            # check_alerts is the only code path that enforces the anti-spam
+            # rule that unconfirmed incidents never notify subscribers.
+            "subscribe_alerts",
+            "list_subscriptions",
+            "check_alerts",
+            "confirm_incident",
+            "unsubscribe",
+            # Deterministic policy gate, exposed so the agent can check before
+            # acting. delete_incident enforces it regardless.
+            "check_mutation_allowed",
         ],
         description="Incident CRM tools for dispatchers to manage events on the map",
     )
@@ -282,8 +331,18 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
             return json.dumps({"error": f"Incident {incident_id} not found"})
         return json.dumps(result, indent=2, default=str)
 
+    async def _check_mutation_allowed(action: str, incident_id: str = "") -> str:
+        """Check whether a state-changing action is permitted before doing it. action is one of: delete, resolve_all, mass_alert, confirm, update. Bulk or unscoped destructive actions are refused. Call this before any delete or bulk operation."""
+        decision = policy.evaluate_mutation(action, incident_id)
+        return json.dumps(decision.as_dict(), indent=2, default=str)
+
     async def _delete_incident(incident_id: str) -> str:
-        """Delete an incident from the system entirely."""
+        """Delete a single incident by its exact ID. Requires a specific ID — bulk deletion is not supported."""
+        # The gate runs here too, not only in check_mutation_allowed. A tool
+        # the model can skip is not a control.
+        decision = policy.evaluate_mutation("delete", incident_id)
+        if not decision.allowed:
+            return json.dumps({"deleted": False, "refused": decision.reason}, indent=2)
         success = db.delete_incident(incident_id)
         if not success:
             return json.dumps({"error": f"Incident {incident_id} not found"})
@@ -298,8 +357,9 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         incident["history"] = history
         return json.dumps(incident, indent=2, default=str)
 
-    async def _get_incident_stats() -> str:
+    async def _get_incident_stats(unused: str = "") -> str:
         """Get dashboard statistics: counts by status, category, borough, severity."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = db.get_stats()
         return json.dumps(result, indent=2, default=str)
 
@@ -323,35 +383,26 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
         )
         return json.dumps(result, indent=2, default=str)
 
-    async def _list_subscriptions() -> str:
+    async def _list_subscriptions(unused: str = "") -> str:
         """List all active alert subscriptions."""
+        del unused  # NAT requires single_fn to take exactly one parameter
         result = db.list_subscriptions()
         return json.dumps(result, indent=2, default=str)
 
     async def _check_alerts(incident_id: str) -> str:
-        """Check which subscribers should be alerted for a given incident. Only confirmed incidents trigger alerts. Incidents are confirmed by dispatchers or auto-confirmed after 3+ independent reports."""
+        """Check whether an incident may alert subscribers, and who would be notified. Only confirmed incidents trigger alerts. Incidents are confirmed by dispatchers or auto-confirmed after enough independent reports. Call this before telling anyone that notifications were sent."""
+        # Delegates to the deterministic gate so the agent, the webhook and the
+        # confirm endpoint cannot disagree about who may be notified.
+        decision = policy.evaluate_alert(incident_id)
         incident = db.get_incident(incident_id)
-        if not incident:
-            return json.dumps({"error": f"Incident {incident_id} not found"})
-        if not incident.get("confirmed"):
-            return json.dumps({
-                "incident_id": incident_id,
-                "alert_status": "NOT_CONFIRMED",
-                "report_count": incident.get("report_count", 1),
-                "message": f"Incident not yet confirmed. Has {incident.get('report_count', 1)} report(s), needs 3 or dispatcher confirmation. No alerts sent.",
-            }, indent=2, default=str)
-        if not incident.get("latitude") or not incident.get("longitude"):
-            return json.dumps({"error": "Incident has no coordinates"})
-        subscribers = db.find_subscribers_near(
-            incident["latitude"], incident["longitude"], incident.get("category", ""),
-        )
         return json.dumps({
             "incident_id": incident_id,
-            "incident_title": incident["title"],
-            "confirmed": True,
-            "report_count": incident.get("report_count", 1),
-            "subscribers_to_alert": subscribers,
-            "count": len(subscribers),
+            "incident_title": (incident or {}).get("title", ""),
+            "alert_allowed": decision.allowed,
+            "reason": decision.reason,
+            "requires_human_approval": decision.requires_human,
+            "subscribers_to_alert": decision.recipients if decision.allowed else [],
+            "count": len(decision.recipients) if decision.allowed else 0,
         }, indent=2, default=str)
 
     async def _confirm_incident(incident_id: str) -> str:
@@ -380,6 +431,91 @@ async def nyc_crm_tools(_config: CRMToolConfig, _builder: Builder) -> AsyncGener
     group.add_function(name="check_alerts", fn=_check_alerts, description=_check_alerts.__doc__)
     group.add_function(name="confirm_incident", fn=_confirm_incident, description=_confirm_incident.__doc__)
     group.add_function(name="unsubscribe", fn=_unsubscribe, description=_unsubscribe.__doc__)
+    group.add_function(name="check_mutation_allowed", fn=_check_mutation_allowed, description=_check_mutation_allowed.__doc__)
+
+    yield group
+
+
+# ---------------------------------------------------------------------------
+# Historical RAG Tools (ChromaDB)
+#
+# NAT 1.8 ships only `milvus_retriever` and `nemo_retriever` retriever
+# providers — there is no Chroma provider — so the six local collections are
+# exposed as an ordinary function group instead of a `retrievers:` block.
+# ---------------------------------------------------------------------------
+
+TOPIC_INDICES = {
+    "flood": "nyc_flood_events",
+    "rodent": "nyc_rodent_inspections",
+    "pothole": "nyc_potholes",
+    "collision": "nyc_collisions",
+    "housing": "nyc_housing_violations",
+    "311": "nyc_311_current",
+}
+
+
+class HistoryToolConfig(FunctionGroupBaseConfig, name="nyc_history_tools"):
+    retriever: RetrieverRef = Field(
+        description="Retriever holding the historical NYC Open Data indices",
+    )
+    top_k: int = Field(default=6, gt=0, description="Records to return per search")
+    include: list[str] = Field(
+        default_factory=lambda: [
+            "search_history",
+            "search_history_by_topic",
+        ],
+        description="Historical NYC Open Data retrieval",
+    )
+
+
+@register_function_group(config_type=HistoryToolConfig)
+async def nyc_history_tools(_config: HistoryToolConfig, _builder: Builder) -> AsyncGenerator[FunctionGroup, None]:
+    group = FunctionGroup(config=_config)
+    retriever = await _builder.get_retriever(_config.retriever)
+
+    def _format(docs, **extra) -> str:
+        """Render results for the agent and record map points as a side effect.
+
+        Coordinates come from indexed `lat`/`lon` fields. The ChromaDB version
+        had to regex them back out of concatenated chunk text, because it
+        stored five records per document with no structured metadata.
+        """
+        records, points = [], []
+        for d in docs:
+            meta = d.metadata or {}
+            records.append({
+                "source": meta.get("dataset") or meta.get("_index", ""),
+                "date": meta.get("date", ""),
+                "text": d.page_content[:300],
+            })
+            lat, lon = meta.get("lat"), meta.get("lon")
+            if lat is not None and lon is not None:
+                points.append({
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "collection": meta.get("_index") or meta.get("dataset", ""),
+                    "label": (meta.get("label") or d.page_content)[:120],
+                })
+        if points:
+            _MAP_POINTS.extend(points)
+        return json.dumps({"found": len(records), "records": records, **extra},
+                          indent=2, default=str)
+
+    async def _search_history(query: str) -> str:
+        """Search historical NYC Open Data records (311 complaints, collisions, potholes, rodent inspections, housing violations, flood events) for anything relevant to the query. Use this for questions about the past, trends, repeat locations, or whether something has happened before."""
+        out = await retriever.search(query, top_k=_config.top_k)
+        return _format(out.results)
+
+    async def _search_history_by_topic(query: str, topic: str) -> str:
+        """Search historical NYC records limited to one topic. topic must be one of: flood, rodent, pothole, collision, housing, 311. Use when the question is clearly about a single domain."""
+        index = TOPIC_INDICES.get(topic.strip().lower())
+        if index is None:
+            return json.dumps({"error": f"Unknown topic '{topic}'. Use one of: {', '.join(TOPIC_INDICES)}"})
+        out = await retriever.search(query, index_name=index, top_k=_config.top_k)
+        return _format(out.results, topic=topic)
+
+    group.add_function(name="search_history", fn=_search_history, description=_search_history.__doc__)
+    group.add_function(name="search_history_by_topic", fn=_search_history_by_topic, description=_search_history_by_topic.__doc__)
 
     yield group
 

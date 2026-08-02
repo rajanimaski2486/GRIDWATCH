@@ -1,3 +1,8 @@
 data/incidents.db
 __pycache__/
 *.pyc
+.venv/
+.nat/
+*.egg-info/
+.env
+data/chromadb/

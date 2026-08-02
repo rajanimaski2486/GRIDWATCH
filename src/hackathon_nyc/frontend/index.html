@@ -801,7 +801,14 @@
     </div>
 
     <script>
-        const API_URL = `http://${location.hostname}:8001`;
+        // Same-origin by default. That covers both deployment shapes:
+        // the FastAPI server serves this file at "/", and on Vercel the
+        // rewrites in vercel.json proxy /api/* and /generate to the backend.
+        // Override for a split local setup:  ?api=http://localhost:8000
+        const API_URL =
+            new URLSearchParams(location.search).get('api')
+            ?? window.__GRIDWATCH_API__
+            ?? '';
         let pickingOnMap = false;
 
         // ==================== MAPBOX GL MAP ====================

@@ -1,20 +1,54 @@
-"""Local SQLite database for incident management (CRM).
+"""Database for incident management (CRM).
 
-Stores incidents that dispatchers can create, update, assign, and resolve.
-Runs on-device — no external database needed. Perfect for DGX Spark hackathon.
+Local SQLite by default. Set DATABASE_URL to a libSQL/Turso URL to persist
+across restarts — required on any container host with an ephemeral
+filesystem, which includes every free tier worth using. libSQL speaks the
+SQLite dialect, so the queries below are unchanged either way.
+
+    DATABASE_URL=libsql://gridwatch-you.turso.io
+    DATABASE_AUTH_TOKEN=...
 """
 
+import os
 import sqlite3
 import json
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent.parent / "data" / "incidents.db"
+# GRIDWATCH_DATA_DIR lets the container put state on a mounted volume.
+_DATA_DIR = Path(os.getenv("GRIDWATCH_DATA_DIR",
+                           Path(__file__).parent.parent.parent / "data"))
+DB_PATH = _DATA_DIR / "incidents.db"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_AUTH_TOKEN = os.getenv("DATABASE_AUTH_TOKEN", "")
 
 
-def get_db() -> sqlite3.Connection:
+def _connect_libsql():
+    """Connect to a libSQL/Turso database.
+
+    Imported lazily so the SQLite path has no extra dependency. Install with:
+        pip install '.[remote-db]'
+    """
+    try:
+        import libsql_experimental as libsql
+    except ImportError as e:  # pragma: no cover - depends on optional extra
+        raise RuntimeError(
+            "DATABASE_URL is set but libsql_experimental is not installed. "
+            "Install it with: pip install '.[remote-db]'"
+        ) from e
+    conn = libsql.connect(database=DATABASE_URL, auth_token=DATABASE_AUTH_TOKEN)
+    return conn
+
+
+def get_db():
     """Get a database connection, creating tables if needed."""
+    if DATABASE_URL:
+        conn = _connect_libsql()
+        _create_tables(conn)
+        return conn
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -23,7 +57,7 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-def _create_tables(conn: sqlite3.Connection):
+def _create_tables(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS incidents (
             id TEXT PRIMARY KEY,

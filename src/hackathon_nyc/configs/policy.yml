@@ -1,0 +1,33 @@
+# GridWatch policy thresholds — read by policy.py.
+#
+# These are enforcement values, not prompt text. Changing them changes what the
+# system will actually do, regardless of what any model decides.
+
+# Independent citizen reports needed before an incident self-confirms.
+confirmation_reports_required: 3
+
+# Sources allowed to create incidents that are confirmed on arrival.
+trusted_sources:
+  - dispatcher
+  - dispatcher_chat
+  - monitor_crossref
+
+# Sources that may never self-confirm, whatever the payload claims.
+untrusted_sources:
+  - citizen_sms
+  - citizen_discord
+  - citizen_voice
+  - citizen_web
+
+# Above this many recipients, a human signs off before anything sends.
+max_alert_recipients: 50
+
+# Master switch. The ALERTS_ENABLED env var overrides this and is the
+# deploy-time kill switch — set ALERTS_ENABLED=false on a public demo.
+alerts_enabled: true
+
+# Actions that always require an explicit incident id.
+destructive_actions:
+  - delete
+  - resolve_all
+  - mass_alert
