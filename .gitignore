@@ -5,3 +5,4 @@ __pycache__/
 .nat/
 *.egg-info/
 .env
+data/chromadb/
