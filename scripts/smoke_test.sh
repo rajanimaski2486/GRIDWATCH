@@ -71,6 +71,30 @@ del os.environ["ALERTS_ENABLED"]
 print("  ✓ ALERTS_ENABLED kill switch honored")
 EOF
 
+echo "== 4b. OpenSearch reachability"
+$PY - <<'EOF'
+import os
+url = os.getenv("OPENSEARCH_URL", "")
+if not url:
+    print("  \u2298 OPENSEARCH_URL not set \u2014 historical search will be unavailable.")
+    print("    Local dev: docker run -d -p 9200:9200 -e discovery.type=single-node \\")
+    print("                 -e DISABLE_SECURITY_PLUGIN=true opensearchproject/opensearch:2.18.0")
+    raise SystemExit(0)
+try:
+    from opensearchpy import OpenSearch
+    kw = {"hosts": [url], "verify_certs": os.getenv("OPENSEARCH_VERIFY_CERTS", "true") != "false"}
+    u, pw = os.getenv("OPENSEARCH_USER", ""), os.getenv("OPENSEARCH_PASSWORD", "")
+    if u and pw and "@" not in url.split("//", 1)[-1]:
+        kw["http_auth"] = (u, pw)
+    c = OpenSearch(**kw)
+    n = c.count(index=os.getenv("OPENSEARCH_INDEX_PREFIX", "nyc_") + "*").get("count", 0)
+    print(f"  \u2713 OpenSearch {c.info()['version']['number']}, {n} documents indexed")
+    if n == 0:
+        print("    (empty \u2014 run: python -m hackathon_nyc.ingest_opensearch --all)")
+except Exception as e:
+    print(f"  \u2717 unreachable: {type(e).__name__}: {e}")
+EOF
+
 echo "== 5. Workflow build + tool count (offline, dummy key)"
 NVIDIA_API_KEY="${NVIDIA_API_KEY:-nvapi-dummy}" $PY - "$CONFIG" <<'EOF' || fail "workflow build failed"
 import asyncio, sys

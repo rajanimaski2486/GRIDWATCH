@@ -31,19 +31,31 @@ llms:
     max_tokens: 2048
 
 embedders:
-  # Used once the RAG index is re-ingested with NIM embeddings.
-  # The committed ChromaDB was built with Chroma's default embedder, so the
-  # historical tools keep using that until re-ingest. See NOTE at bottom.
+  # Query and document embeddings both come from this NIM. Nothing embeds
+  # locally any more, which is what let ChromaDB's ONNX model leave the image.
   nv_embed:
     _type: nim
     model_name: nvidia/nv-embedqa-e5-v5
+
+retrievers:
+  # Custom provider registered in retrievers/opensearch.py — NAT 1.8 ships
+  # only milvus_retriever and nemo_retriever. Endpoint and credentials come
+  # from OPENSEARCH_URL / OPENSEARCH_USER / OPENSEARCH_PASSWORD, never here.
+  # Index with: python -m hackathon_nyc.ingest_opensearch --all
+  history:
+    _type: opensearch_retriever
+    embedding_model: nv_embed
+    index_name: "nyc_*"     # every collection at once; per-topic search narrows it
+    top_k: 6
 
 function_groups:
   flood_tools:     { _type: nyc_flood_tools }      # 7 tools
   complaint_tools: { _type: nyc_311_tools }        # 4 tools
   geo_tools:       { _type: nyc_geo_tools }        # 3 tools
-  crm_tools:       { _type: nyc_crm_tools }        # 12 tools
-  history_tools:   { _type: nyc_history_tools }    # 2 tools — ChromaDB RAG
+  crm_tools:       { _type: nyc_crm_tools }        # 13 tools
+  history_tools:                                   # 2 tools — OpenSearch RAG
+    _type: nyc_history_tools
+    retriever: history
 
 functions:
   current_datetime:
@@ -188,7 +200,6 @@ eval:
       _type: avg_num_llm_calls
 
 # NOTE on RAG: NAT 1.8 registers only `milvus_retriever` and `nemo_retriever`
-# as retriever providers — there is no Chroma provider. The 6 ChromaDB
-# collections stay behind tools/historical_lookup.py and should be exposed as a
-# `nyc_history_tools` function group (next step) rather than a `retrievers:`
-# block. Switching to `nv_embed` requires re-running ingest.
+# as retriever providers. GridWatch adds `opensearch_retriever` in
+# retrievers/opensearch.py using NAT's own registration API. Hybrid kNN+BM25
+# is supported but off by default — see that module for the measurement.

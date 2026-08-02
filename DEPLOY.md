@@ -7,6 +7,7 @@ Three pieces. Only one holds state, and none of them run a model.
 | Dashboard (`index.html`) | Vercel | yes, no card |
 | FastAPI + NAT runtime | Hugging Face Spaces (Docker) | yes, no card |
 | Incidents + subscriptions | Turso (libSQL) | yes, no card |
+| Historical search index | Aiven for OpenSearch | free trial / paid |
 | Reasoning | build.nvidia.com — called, never deployed | free credits |
 
 Everything below has been verified locally against the real image except the
@@ -27,11 +28,14 @@ Then open http://localhost:7860 and check:
 curl -s localhost:7860/api/agent/status | python3 -m json.tool
 ```
 
-You want `"state": "ready"` and `"tools": 29`. If `state` is `degraded`, the
+You want `"state": "ready"`, `"tools": 29`, and `"rag_backend": "opensearch"`
+with a non-zero `rag_docs`. If `state` is `degraded`, the
 `detail` field says exactly why and the server still serves the map and the
 incident API in read-only mode — that is by design, not a partial failure.
 
-Measured on this image: healthy in ~10 s, 3.25 GB, NAT builds all 29 tools.
+Measured on this image: healthy in ~15 s, **2.46 GB**, NAT builds all 29 tools.
+(It was 3.25 GB with ChromaDB embedded — dropping the local index and its ONNX
+embedding model in favour of hosted OpenSearch removed ~790 MB.)
 
 ---
 
@@ -70,6 +74,7 @@ Then in **Settings → Variables and secrets** add:
 | `NVIDIA_API_KEY` | secret | the only one needed to think |
 | `DATABASE_URL` | secret | from step 2 |
 | `DATABASE_AUTH_TOKEN` | secret | from step 2 |
+| `OPENSEARCH_URL` | secret | Aiven service URI, from step 2b |
 | `GRIDWATCH_TOKEN` | secret | see step 4 — set this |
 | `ALLOWED_ORIGINS` | variable | your Vercel URL, after step 3 |
 | `ALERTS_ENABLED` | variable | **`false` until you mean it** |
@@ -102,6 +107,31 @@ pip install '.[remote-db]'
 ```
 
 Leave `DATABASE_URL` unset for local development and you stay on plain SQLite.
+
+---
+
+## 2b. Historical index → Aiven for OpenSearch
+
+Retrieval no longer ships in the image. Create an OpenSearch service in the
+Aiven console, copy its **Service URI** — Aiven embeds the credentials, so paste
+it whole — and put it in `.env` and in the Space secrets:
+
+```
+OPENSEARCH_URL=https://avnadmin:PASSWORD@gridwatch-xxxx.aivencloud.com:12345
+```
+
+Then index. This calls the NIM embedder, so `NVIDIA_API_KEY` must be set:
+
+```bash
+pip install -e .
+python -m hackathon_nyc.ingest_opensearch --all --limit 300
+```
+
+Verify with `./scripts/smoke_test.sh` — stage 4b reports the document count.
+Re-run ingest with `--recreate` to rebuild an index from scratch.
+
+> The index lives outside the container, so it survives restarts and rebuilds,
+> and the same index can back several deployments.
 
 ---
 
@@ -160,6 +190,6 @@ free CPU tier viable.
 | Host | Notes |
 |---|---|
 | **Google Cloud Run** | Real free tier, needs a card. Scale-to-zero kills the monitor; pair with Cloud Scheduler if you enable it. |
-| **Render** | Free, no card, but 512 MB RAM is tight against a 3.25 GB image with ChromaDB and onnxruntime resident. Spins down after 15 min. |
+| **Render** | Free, no card, but 512 MB RAM is tight against a 2.46 GB image. Spins down after 15 min. |
 | **Fly.io / Railway** | Trial credit only. |
 | **Vercel** | Frontend only — serverless, 60 s cap, no persistent disk, no background loop, 250 MB bundle limit. |
